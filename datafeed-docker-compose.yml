@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  embed:
+    build:
+      context: .
+      dockerfile: datafeed_processing/embed.Dockerfile
+    volumes:
+      - ./datafeed_processing:/usr/src/datafeed_processing
+    networks:
+      - datafeed_network
+    restart: unless-stopped
+
+  scrape:
+    build:
+      context: .
+      dockerfile: datafeed_processing/scrape.Dockerfile
+    volumes:
+      - ./datafeed_processing:/usr/src/datafeed_processing
+    networks:
+      - datafeed_network
+    restart: unless-stopped
+
+networks:
+  datafeed_network:
+    driver: bridge
