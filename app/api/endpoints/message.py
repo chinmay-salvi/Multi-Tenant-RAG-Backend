@@ -57,13 +57,35 @@ async def get_messages(
     token_payload: dict = Depends(validate_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Retrieves the sequential message history associated with a specific conversation ID.
+
+    This function does the following:
+    1. Validates that the requesting user exists within the organization matched in the JWT.
+    2. Queries the database for the targeted conversation record.
+    3. If found, fetches all active message rows (both user queries and assistant responses)
+       ordered chronologically.
+    4. Serializes message role, text content, and creation timestamps for client usage.
+
+    Args:
+        userId (UUID): The user ID requesting message history.
+        conversationId (UUID): Associated conversation identifier.
+        token_payload (dict): Decoded and verified tenant JWT.
+        db (AsyncSession): Active SQLAlchemy database session.
+
+    Returns:
+        dict: A response containing conversation metadata and list of message maps.
+    """
+    # Enforce organizational member verification
     _ = await fetch_existing_user(
         org_id=token_payload["orgId"], user_id=token_payload["userId"], db=db
     )
 
+    # Fetch targeted conversation record from relational DB
     conversation = await fetch_conversation(conversation_id=conversationId, db=db)
 
     if conversation:
+        # Retrieve message log records associated with the conversation
         messages = await fetch_messages(conversation_id=conversationId, db=db)
 
         return {
@@ -94,30 +116,49 @@ async def message_conversation(
     db: AsyncSession = Depends(get_db),
 ) -> EventSourceResponse:
     """
-    Send a message from a user to a conversation, receive a SSE stream of the assistant's response.
-    Each event in the SSE stream is a Message object. As the assistant continues processing the response,
-    the message object's sub_processes list and content string is appended to. While the message is being
-    generated, the status of the message will be PENDING. Once the message is generated, the status will
-    be SUCCESS. If there was an error in processing the message, the final status will be ERROR.
+    Handles client messages to a chatbot conversation, generating an SSE (Server-Sent Events) stream.
+
+    The endpoint executes the following workflow:
+    1. Directs a security lookup to confirm if the chatbot is public, otherwise asserts JWT authenticity.
+    2. Retrieves tenant trial/subscription metadata from the cache and counts message utilization.
+    3. Triggers plan guardrails to halt execution if message limits are exceeded.
+    4. Fetches conversation history to pass as grounded context.
+    5. Spawns an asynchronous background generator that yields real-time assistant responses.
+
+    Args:
+        request (Request): Active HTTP request object.
+        conversationId (UUID): Target conversation ID.
+        chatbotId (UUID): Associated Chatbot ID.
+        userMessageString (str): The query string submitted by the user.
+        authorization (str, optional): HTTP Bearer token checked for private chatbots.
+        userId (UUID, optional): User ID checked for private chatbots.
+        db (AsyncSession): SQLAlchemy active database session.
+
+    Returns:
+        EventSourceResponse: Real-time SSE stream sending JSON-serialized message chunks.
     """
     chatbot = await fetch_chatbot_directly(db=db, chatbot_id=chatbotId, ensure=True)
 
+    # Secure private endpoints from unauthorized visitors
     if not chatbot.isPublic:
         if authorization and userId:
             _ = await validate_user(request, authorization)
         else:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # Fetch organization limits and active quota metrics
     plan_data = await fetch_cached_plan_data(chatbot.orgId)
     error_message = None
 
     if plan_data:
+        # Enforce limits checks for trial organization tier
         if not plan_data.get("razorpay_subscriptions", []) and plan_data.get(
             "user_trial", []
         ):
             start_datetime = plan_data["user_trial"][0]["trial_start"]
             end_datetime = plan_data["user_trial"][0]["trial_end"]
 
+            # Confirm trial subscription window validity
             if check_datetime_validity(start_datetime, end_datetime):
                 utilized_messages = await count_message_utilization(
                     chatbot.orgId, start_datetime, end_datetime, db
@@ -132,6 +173,7 @@ async def message_conversation(
     else:
         raise HTTPException(status_code=404, detail="No plan found.")
 
+    # Yield plan error message chunks immediately if quota is exceeded
     if error_message:
 
         async def event_publisher():
@@ -145,6 +187,7 @@ async def message_conversation(
 
         return EventSourceResponse(event_publisher())
 
+    # Retrieve conversation metadata and prior message history
     conversation = await fetch_conversation_with_messages(db, conversationId)
 
     if conversation is None:
@@ -296,6 +339,34 @@ async def managed_conversation_message(
     bot_token: str = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Receives incoming webhook events and AI suggestion queries from the managed inbox panel.
+
+    This dual-mode endpoint operates as follows:
+    1. **AI Assist Mode (`ai_assist` payload exists)**:
+       Acts as a prompt completion co-pilot for human agents. It builds an isolated chat engine
+       instance from conversation history and outputs response suggestions directly to the agent's screen.
+    2. **Standard Webhook Mode (`incoming` message type)**:
+       Synchronizes user-to-agent exchanges with the relational database. If a new conversation starts,
+       it automatically provisions metadata. It invokes the standard RAG chat pipeline to compute the
+       AI response, performs relevance-checking guardrails to detect handoff requests, registers the
+       message rows in the database, and dispatches the final response to the customer via `notify_managed_backend`.
+
+    Args:
+        request (Request): Active HTTP request object holding json body payload.
+        bot_id (UUID): Target chatbot identifier parameter.
+        bot_token (str): Secret authorization token used to communicate with the managed backend inbox service.
+        db (AsyncSession): Active SQLAlchemy database session.
+
+    Returns:
+        dict: Completion response payloads or callback confirmation payloads.
+
+    Raises:
+        HTTPException:
+            - 422 Unprocessable Entity: If request validation against Pydantic schemas fails.
+            - 400 Bad Request: If request JSON parsing fails.
+            - 500 Internal Server Error: If RAG processing or DB operations raise exceptions.
+    """
     try:
         body = await request.json()
         chatbot = await fetch_chatbot_directly(db=db, chatbot_id=bot_id, ensure=True)
@@ -520,10 +591,31 @@ async def managed_conversation_message(
 async def relevance_check_and_transfer(
     account_id, conversation_id, bot_token, query: str, response: str
 ) -> str:
-    # Extract relevance score
+    """
+    Parses LLM outputs for relevance and human-transfer scoring, triggering handoff if needed.
+
+    This function executes the following workflow:
+    1. Uses regular expressions to extract `[RELEVANCE_SCORE: X]` and `[TRANSFER_TO_HUMAN_SCORE: Y]`
+       from the generated RAG response text.
+    2. Strips these tracking markers from the final message text so that customer-facing text is clean.
+    3. Asserts the parsed `transfer_score` against designated thresholds.
+    4. If the threshold is exceeded (e.g. `transfer_score > 0.7`), it triggers an asynchronous
+       handoff request to a live support representative by calling `transfer_to_human_agent`.
+
+    Args:
+        account_id (str): The external account ID for the inbox widget.
+        conversation_id (str): The active conversation identifier.
+        bot_token (str): Secret credential for webhook dispatching.
+        query (str): The raw text submitted by the customer.
+        response (str): The raw text response computed by the LLM containing meta scores.
+
+    Returns:
+        str: Cleaned text response string optionally concatenated with handoff notifications.
+    """
+    # Extract structural relevance markers from LLM response text
     relevance_match = re.search(r"\[RELEVANCE_SCORE: (0\.\d+|1\.00?)\]", response)
 
-    # Extract transfer to human score
+    # Extract structural transfer markers from LLM response text
     transfer_match = re.search(
         r"\[TRANSFER_TO_HUMAN_SCORE: (0\.\d+|1\.00?)\]", response
     )
@@ -532,17 +624,17 @@ async def relevance_check_and_transfer(
         relevance_score = float(relevance_match.group(1))
         transfer_score = float(transfer_match.group(1))
 
-        # Remove both scores from the response
+        # Purge tracking annotations from the final text payload
         response = re.sub(r"\[RELEVANCE_SCORE: (0\.\d+|1\.00?)\]", "", response)
         response = re.sub(
             r"\[TRANSFER_TO_HUMAN_SCORE: (0\.\d+|1\.00?)\]", "", response
         ).strip()
 
         # Define thresholds for relevance and transfer scores
-        relevance_threshold = 0.5  # You can adjust this threshold as needed
-        transfer_threshold = 0.7  # You can adjust this threshold as needed
+        relevance_threshold = 0.5  
+        transfer_threshold = 0.7  
 
-        # if relevance_score < relevance_threshold or transfer_score > transfer_threshold:
+        # Trigger human agent handoff if the transfer score exceeds safety limits
         if transfer_score > transfer_threshold:
             human_transfer_response = await transfer_to_human_agent(
                 account_id, conversation_id, bot_token
@@ -553,7 +645,19 @@ async def relevance_check_and_transfer(
 
 
 async def transfer_to_human_agent(account_id, conversation_id, bot_token) -> str:
+    """
+    Triggers a live human agent handoff by altering the conversation status in the inbox panel.
+
+    Args:
+        account_id (str): The external account ID for the inbox widget.
+        conversation_id (str): The active conversation identifier.
+        bot_token (str): Secret credential for webhook dispatching.
+
+    Returns:
+        str: A message stating that the conversation has been transferred to a human agent.
+    """
     print("TOOL CALLED: transfer_to_human_agent")
+    # Dispatch state alteration request to the remote inbox panel API
     response = change_conversation_status(account_id, conversation_id, bot_token)
     return (
         "I'm transferring you to a human agent who will be able to assist you better."

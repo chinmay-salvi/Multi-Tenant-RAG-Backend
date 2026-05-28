@@ -24,12 +24,25 @@ async def get_tag_data(
     token_payload: dict = Depends(validate_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Retrieves all classification tags registered under a tenant organization.
+
+    Args:
+        userId (UUID): Requesting user ID.
+        token_payload (dict): Decoded and verified tenant JWT.
+        db (AsyncSession): Active SQLAlchemy database session.
+
+    Returns:
+        dict: A JSON response containing the requesting userId and list of tag mappings.
+    """
+    # Assert identity mapping
     _ = await fetch_existing_user(
         org_id=token_payload["orgId"],
         user_id=token_payload["userId"],
         db=db,
         ensure=True,
     )
+    # Fetch all tags associated with the tenant
     tags = await fetch_all_tags_for_org(org_id=token_payload["orgId"], db=db)
 
     return {
@@ -45,20 +58,26 @@ async def add_tag(
     db: AsyncSession = Depends(get_db),
 ) -> str:
     """
-    Adds a new tag.
-    :param body: Body containing tag details.
-    :param token_payload: Token payload with user and organization information.
-    :param db: Asynchronous database session.
-    :return: Success message.
+    Registers a new datafeed classification tag under the tenant organization.
+
+    Enforces tag name uniqueness scoped per tenant to prevent collisions.
+
+    Args:
+        body (schema.TagsAdd): Struct containing tag name parameters.
+        token_payload (dict): Decoded and verified tenant token.
+        db (AsyncSession): Active database session.
+
+    Returns:
+        str: Outcome confirmation message string.
     """
-    # Ensure organization exists using orgId from token_payload and also user exists using userId
+    # Ensure organization and user mapping exist inside the tenant DB
     _ = await fetch_existing_user(
         org_id=token_payload["orgId"],
         user_id=token_payload["userId"],
         db=db,
         ensure=True,
     )
-    # Check if the tag already exists for the given orgId and tagName
+    # Check if the tag name is already active for the organization
     existing_tag = await fetch_existing_tag(
         tag=body.tagName, org_id=token_payload["orgId"], db=db
     )
@@ -67,7 +86,7 @@ async def add_tag(
         return "Tag already exists"
 
     try:
-        # Add the new tag
+        # Create and persist the Tag row
         tag = Tag(
             tagName=body.tagName,
             orgId=token_payload["orgId"],
@@ -77,6 +96,5 @@ async def add_tag(
         await db.refresh(tag)
         return "Tag added successfully"
     except Exception as e:
-        # Handle other exceptions
         print("An unexpected error occurred:", e)
         return "An unexpected error occurred"

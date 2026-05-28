@@ -65,11 +65,25 @@ logger = logging.getLogger(__name__)
 async def get_tool_service_context(
     callback_handlers: List[BaseCallbackHandler],
 ) -> ServiceContext:
+    """
+    Initializes LlamaIndex ServiceContext using the Groq LLM and Cloudflare Embeddings.
+
+    Retrieves dynamically rotated auth credentials for Groq and Cloudflare, hooks in the SSE
+    event callbacks via CallbackManager, and returns a standard LlamaIndex ServiceContext config.
+
+    Args:
+        callback_handlers (List[BaseCallbackHandler]): List of handlers to push execution logs.
+
+    Returns:
+        ServiceContext: The fully configured LlamaIndex ServiceContext.
+    """
+    # Fetch dynamically rotated API credentials from SysAuthCred
     groq_llm_auth_creds = await get_auth_creds("GROQ_LLM")
     cloudflare_embed_auth_creds = await get_auth_creds("CLOUDFLARE_EMBED")
 
     callback_manager = CallbackManager(callback_handlers)
 
+    # Initialize Groq LLM (e.g., Llama 3)
     llm = Groq(
         model=LLM_MODEL_NAME,
         **groq_llm_auth_creds,
@@ -77,10 +91,8 @@ async def get_tool_service_context(
         temperature=LLM_TEMPERATURE,
         callback_manager=callback_manager,
     )
-    # api_key = ""
-    # url = ""
-    # llm = CustomLLM(url=url, api_key=api_key, callback_manager=callback_manager)
 
+    # Initialize Cloudflare Embedding model (e.g. BGE models)
     embedding_model = CloudflareEmbedding(
         model=CLOUDFLARE_EMBEDDING_MODEL_NAME,
         **cloudflare_embed_auth_creds,
@@ -95,31 +107,27 @@ async def get_tool_service_context(
 async def get_tool_service_context_open_ai(
     callback_handlers: List[BaseCallbackHandler],
 ) -> ServiceContext:
-    # groq_llm_auth_creds = await get_auth_creds("GROQ_LLM")
+    """
+    Initializes LlamaIndex ServiceContext using the OpenAI LLM and Cloudflare Embeddings.
+
+    Args:
+        callback_handlers (List[BaseCallbackHandler]): Callback event receivers.
+
+    Returns:
+        ServiceContext: The fully configured LlamaIndex ServiceContext.
+    """
     cloudflare_embed_auth_creds = await get_auth_creds("CLOUDFLARE_EMBED")
 
     callback_manager = CallbackManager(callback_handlers)
 
-    # llm = Groq(
-    #     model=LLM_MODEL_NAME,
-    #     **groq_llm_auth_creds,
-    #     max_tokens=LLM_MAX_TOKENS,
-    #     temperature=LLM_TEMPERATURE,
-    #     callback_manager=callback_manager,
-    # )
-
+    # Initialize OpenAI GPT LLM
     llm = OpenAI(
         model=LLM_MODEL_NAME_OPENAI,
         api_key=OPENAI_API_KEY,
-        # max_tokens=LLM_MAX_TOKENS,
-        # temperature=LLM_TEMPERATURE,
         callback_manager=callback_manager,
     )
 
-    # api_key = ""
-    # url = ""
-    # llm = CustomLLM(url=url, api_key=api_key, callback_manager=callback_manager)
-
+    # Cloudflare is utilized for embeddings generation to optimize costs
     embedding_model = CloudflareEmbedding(
         model=CLOUDFLARE_EMBEDDING_MODEL_NAME,
         **cloudflare_embed_auth_creds,
@@ -141,25 +149,34 @@ async def get_chat_engine(
     hallucinationFixer: str | None,
     businessContactDetails: str | None,
 ) -> CondensePlusContextChatEngine:
+    """
+    Instantiates and configures a CondensePlusContextChatEngine scoped to the tenant organization.
+
+    This engine operates as follows:
+    1. Rephrases follow-up user inputs into standalone queries using the last 20 messages.
+    2. Utilizes VectorIndexRetriever with metadata filters to fetch context belonging ONLY
+       to this specific organization (orgID) and chatbot (chatbotIds).
+    3. Grounds the response utilizing customized guidelines, company descriptions, and contact details.
+    4. Streams assistant tokens back through the specified callback handlers.
+
+    Args:
+        callback_handler_list (List[BaseCallbackHandler]): List of Callback handlers to stream SSE outputs.
+        chat_history (List[ChatMessage]): The preceding message list inside this conversation.
+        chatbot_id (UUID): The target chatbot ID.
+        org_id (UUID): The organization tenant ID.
+        companyDo (str | None): Brief description of what the company does.
+        chatbotFor (str | None): Purpose of the chatbot.
+        hallucinationFixer (str | None): Custom anti-hallucination prompt overrides.
+        businessContactDetails (str | None): Support email/phone number/site contact details.
+
+    Returns:
+        CondensePlusContextChatEngine: The fully wired LlamaIndex chat engine instance.
+    """
     print("*" * 20, "LOGGER ---- get_chat_engine", "*" * 20)
 
-    # groq_llm_auth_creds = await get_auth_creds("GROQ_LLM")
-    # summarizer_llm = Groq(
-    #     model="llama3-8b-8192",
-    #     **groq_llm_auth_creds,
-    #     max_tokens=512,
-    #     temperature=LLM_TEMPERATURE,
-    # )
-
-    # last_10_messages = chat_history[-20:]
-    # memory = ChatSummaryMemoryBuffer.from_defaults(
-    #     chat_history=last_10_messages,
-    #     llm=summarizer_llm,
-    #     token_limit=512,
-    # )
-    # memory = ChatMemoryBuffer.from_defaults(chat_history=chat_history, token_limit=2048)
     logger.debug("Chat history: %s", chat_history)
 
+    # Setup the execution context using rotated Groq API keys
     service_context = await get_tool_service_context(callback_handler_list)
 
     vector_store = await get_vector_store_singleton()
@@ -168,6 +185,7 @@ async def get_chat_engine(
         vector_store=vector_store, service_context=service_context
     )
 
+    # Scope vector query specifically to this chatbot and organization to prevent cross-tenant queries
     retriever = VectorIndexRetriever(
         index=index,
         similarity_top_k=5,
@@ -809,6 +827,31 @@ async def get_chat_engine_for_managed_backend(
     conversation_id,
     bot_token,
 ) -> CondensePlusContextChatEngine:
+    """
+    Configures and initializes a CondensePlusContextChatEngine tailored for managed inbox backends.
+
+    This specialized RAG engine enforces:
+    1. Mandatory scoring tokens ([RELEVANCE_SCORE] and [TRANSFER_TO_HUMAN_SCORE]) to drive
+       automatic handoff logic.
+    2. Scoped retrieval metrics limiting access strictly to organizational files.
+    3. OpenAI LLM utilization with Cloudflare embeddings.
+
+    Args:
+        callback_handler_list (List[BaseCallbackHandler]): List of Callback handlers to stream SSE outputs.
+        chat_history (List[ChatMessage]): Preceding chat history.
+        chatbot_id (UUID): Target chatbot ID.
+        org_id (UUID): Tenant organization ID.
+        companyDo (str | None): Brief company context description.
+        chatbotFor (str | None): Purpose of the chatbot.
+        hallucinationFixer (str | None): Anti-hallucination overrides.
+        businessContactDetails (str | None): Business contact information.
+        account_id: Managed inbox account ID.
+        conversation_id: Managed inbox conversation ID.
+        bot_token: Managed inbox access token.
+
+    Returns:
+        CondensePlusContextChatEngine: The fully wired LlamaIndex chat engine instance.
+    """
     print("*" * 20, "LOGGER ---- get_chat_engine", "*" * 20)
 
     logger.debug("Chat history: %s", chat_history)
@@ -982,8 +1025,27 @@ async def handle_chat_message(
     businessContactDetails: str | None,
     send_chan: MemoryObjectSendStream,
 ) -> None:
+    """
+    Orchestrates the asynchronous streaming chat generation for user conversations.
+
+    This function does the following:
+    1. Reconstructs LlamaIndex `ChatMessage` history from previous successful database messages.
+    2. Instantiates a dedicated `get_chat_engine` scoped to the current tenant organization.
+    3. Triggers token streaming over an AnyIO memory send channel (`send_chan`).
+    4. Automatically yields error descriptions if generation yields an empty output.
+
+    Args:
+        conversation (schema.Conversation): Active conversation schema holding messages history.
+        user_message (str): Current input query string.
+        companyDo (str | None): Target company context description.
+        chatbotFor (str | None): Target chatbot agent purpose.
+        hallucinationFixer (str | None): Custom anti-hallucination guidelines.
+        businessContactDetails (str | None): Support email/phone business context.
+        send_chan (MemoryObjectSendStream): AnyIO memory channel to stream tokens asynchronously.
+    """
     print("*" * 20, "LOGGER ---- handle_chat_message", "*" * 20)
     async with send_chan:
+        # Load preceding successful conversation messages
         chat_history = [
             ChatMessage(
                 content=message.content,
@@ -997,6 +1059,7 @@ async def handle_chat_message(
             if message.content.strip() and message.status == MessageStatusEnum.SUCCESS
         ]
 
+        # Configure the RAG chat engine instance
         chat_engine = await get_chat_engine(
             [ChatCallbackHandler(send_chan)],
             chat_history,
@@ -1008,6 +1071,7 @@ async def handle_chat_message(
             businessContactDetails,
         )
 
+        # Notify callbacks that the query engine construction has finished
         await send_chan.send(
             schema.StreamedMessageSubProcess(
                 event_id=str(uuid4()),
@@ -1017,12 +1081,13 @@ async def handle_chat_message(
         )
         logger.debug("Engine received")
 
+        # Stream LLM generation tokens asynchronously
         streaming_chat_response: StreamingAgentChatResponse = (
             await chat_engine.astream_chat(user_message)
-            # await chat_engine.achat(user_message)
         )
         complete_response_str = ""
 
+        # Intercept tokens and yield them to the send channel in real time
         async for text in streaming_chat_response.async_response_gen():
             complete_response_str += text
 
@@ -1034,6 +1099,7 @@ async def handle_chat_message(
 
             await send_chan.send(schema.StreamedMessage(content=text))
 
+        # Fallback response if generation fails to yield any text output
         if complete_response_str.strip() == "":
             await send_chan.send(
                 schema.StreamedMessage(

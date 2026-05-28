@@ -8,10 +8,24 @@ from config import SPB_CONN_URL, SPB_KEY
 supabase_client = create_client(SPB_CONN_URL, SPB_KEY) if SPB_CONN_URL and SPB_KEY else None
 
 
-def fetch_plan_data(org_id: str):
+def fetch_plan_data(org_id: str) -> dict | None:
+    """
+    Directly queries the Supabase database to fetch subscription and trial limits for a background worker org.
+
+    This background script version of fetch_plan_data mirrors the API gateway logic, utilizing
+    the standard Supabase client directly without async dependencies (as workers run synchronously or
+    via standard threads).
+
+    Args:
+        org_id (str): Unique string ID of the tenant organization.
+
+    Returns:
+        dict | None: Mapped plan, Razorpay, or user trial limits dictionary.
+    """
     if supabase_client is None:
         return None
     try:
+        # Query active subscription tables in Supabase
         razorpay_query = (
             supabase_client.table("razorpay_subscriptions")
             .select("status,current_start,current_end,plan_id")
@@ -21,10 +35,9 @@ def fetch_plan_data(org_id: str):
 
         razorpay_data = razorpay_query.execute().data
 
-        # Extract plan_ids from the razorpay_subscriptions data
+        # If a subscription exists, parse datetimes and retrieve matching plan details
         plan_ids = [item["plan_id"] for item in razorpay_data] if razorpay_data else []
 
-        # Query plans for plan_notes using plan_ids from razorpay_subscriptions
         if plan_ids:
             plans_query = (
                 supabase_client.table("plans")
@@ -34,7 +47,7 @@ def fetch_plan_data(org_id: str):
             plans_data = plans_query.execute().data
             user_trial_data = []
         else:
-            # Query user_trial for trial_start, trial_end, and notes
+            # Query user_trial metadata as fallback if no Razorpay subscription is active
             user_trial_query = (
                 supabase_client.table("user_trial")
                 .select("trial_start, trial_end, notes")
@@ -54,18 +67,45 @@ def fetch_plan_data(org_id: str):
 
 
 def check_datetime_validity(start_datetime_str: str, end_datetime_str: str) -> bool:
+    """
+    Asserts if the current machine time lies within a specified subscription or trial window.
+
+    Ensures timezone consistency by converting current local time to the input timezone.
+
+    Args:
+        start_datetime_str (str): ISO formatted start string.
+        end_datetime_str (str): ISO formatted end string.
+
+    Returns:
+        bool: True if the current time is inside the bounds; False otherwise.
+    """
     # Parse the string datetimes into datetime objects
     start_datetime = parser.parse(start_datetime_str)
     end_datetime = parser.parse(end_datetime_str)
 
-    # Get the current datetime ensuring same time
+    # Get the current datetime ensuring same time zone constraints
     current_datetime = datetime.now(start_datetime.tzinfo)
 
     # Check if the current datetime is between the two datetimes
     return start_datetime <= current_datetime <= end_datetime
 
 
-def check_datafeed_token_limit(org_id, utilised_token_count):
+def check_datafeed_token_limit(org_id: str, utilised_token_count: int) -> str | None:
+    """
+    Validates if a tenant organization's total token count remains within their plan limits.
+
+    It validates:
+    1. Active subscription current window validity.
+    2. Exceedance of maximum tokens allowed in plans/trial quotas.
+
+    Args:
+        org_id (str): Organization tenant ID.
+        utilised_token_count (int): Sum of tokens across all active datafeeds for this tenant.
+
+    Returns:
+        str | None: An error message description if the limit is exceeded or plan expired;
+                    None if the organization is active and compliant.
+    """
     try:
         plan_data = fetch_plan_data(org_id)
 
@@ -76,6 +116,7 @@ def check_datafeed_token_limit(org_id, utilised_token_count):
         user_trial = plan_data.get("user_trial", [])
         plans = plan_data.get("plans", [])
 
+        # Process Razorpay plan limits
         if razorpay_subscriptions:
             subscription = razorpay_subscriptions[0]
             if not check_datetime_validity(
@@ -88,6 +129,7 @@ def check_datafeed_token_limit(org_id, utilised_token_count):
             ):
                 return "Max tokens reached, please upgrade."
 
+        # Process standard trial limits
         elif user_trial:
             trial = user_trial[0]
             if not check_datetime_validity(trial["trial_start"], trial["trial_end"]):

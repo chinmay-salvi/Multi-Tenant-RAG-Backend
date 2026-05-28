@@ -188,8 +188,25 @@ async def fetch_and_read_document_from_s3(
     return documents, token_count
 
 
-async def fetch_and_index_documents(data_feed_message: DataFeedEmbeddingMessageQueue):
+async def fetch_and_index_documents(data_feed_message: DataFeedEmbeddingMessageQueue) -> Tuple[bool, int]:
+    """
+    Downloads an S3 document, parses it, generates semantic embeddings, and stores them in pgvector.
+
+    This function does the following:
+    1. Downloads the active document file from S3 to a local temporary location.
+    2. Loads the text data using SimpleDirectoryReader.
+    3. Calculates token counts to check subscription limits.
+    4. Applies transformations: chunk splitting and BGE embedding generation.
+    5. Inserts nodes (chunks + embeddings) into the PGVectorStore database table.
+
+    Args:
+        data_feed_message (DataFeedEmbeddingMessageQueue): The message queue record holding metadata.
+
+    Returns:
+        Tuple[bool, int]: (success_flag, calculated_token_count)
+    """
     try:
+        # Retrieve document from S3 and get text representation
         llama_index_docs, token_count = await fetch_and_read_document_from_s3(
             data_feed_message.orgId,
             data_feed_message.dataFeedId,
@@ -197,48 +214,63 @@ async def fetch_and_index_documents(data_feed_message: DataFeedEmbeddingMessageQ
         )
         global auth_creds_circular_array
 
+        # Dynamically rotate active Cloudflare embedding API credentials using an asyncio lock
         async with lock:
             cloudflare_embed_auth_creds = auth_creds_circular_array.get_next()
 
         embed_model = CloudflareEmbedding(
             model=CLOUDFLARE_EMBEDDING_MODEL_NAME, **cloudflare_embed_auth_creds
         )
+        
+        # Build ingestion pipeline with BGE text splitting & embedding generation
         pipeline = IngestionPipeline(
             transformations=[
                 node_parser,
                 embed_model,
             ],
         )
+        
+        # Parse and process embeddings concurrently using 3 background workers
         nodes = await pipeline.arun(documents=llama_index_docs, num_workers=3)
+        
+        # Store processed chunks directly in PostgreSQL pgvector tables
         index = VectorStoreIndex.from_vector_store(
             vector_store=vector_store, embed_model=embed_model
         )
         index.insert_nodes(nodes=nodes)
+        
         return True, token_count
     except Exception as e:
         print("Exception:", e)
         return False, -1
 
 
-async def poll_data_and_process_embedding_messages(task_num):
-    while True:
-        # logger.info(f"Running Task No.: {task_num}")
+async def poll_data_and_process_embedding_messages(task_num: int):
+    """
+    Background loop that continuously polls and processes pending datafeed ingestion tasks.
 
+    Polled elements are secured via 'with_for_update(skip_locked=True)' to prevent multiple workers
+    from processing the same task.
+
+    Args:
+        task_num (int): Identifier for this background worker thread.
+    """
+    while True:
         async with SessionLocal() as session:
-            # Fetch the oldest pending message from the queue
+            # Safely fetch the oldest pending queue message, skipping rows already locked by other threads
             message = await session.scalar(
                 select(DataFeedEmbeddingMessageQueue)
                 .filter(DataFeedEmbeddingMessageQueue.messageStatus == "PENDING")
                 .order_by(asc(DataFeedEmbeddingMessageQueue.createdAt))
                 .limit(1)
-                .with_for_update(skip_locked=True)  # Lock the fetched row
+                .with_for_update(skip_locked=True)
             )
 
             if message:
                 logger.info(
                     f"Processing Message: {message.messageId} in Task No.: {task_num}"
                 )
-                # Set the message status to processing
+                # Set message status to PROCESSING to signal active state
                 await session.execute(
                     update(DataFeedEmbeddingMessageQueue)
                     .where(DataFeedEmbeddingMessageQueue.messageId == message.messageId)
@@ -247,6 +279,7 @@ async def poll_data_and_process_embedding_messages(task_num):
                 await session.commit()
                 await session.refresh(message)
 
+                # Fetch the organization's sum of active token counts
                 utilized_tokens = (
                     await session.scalar(
                         select(func.sum(DataFeed.tokenCount)).where(

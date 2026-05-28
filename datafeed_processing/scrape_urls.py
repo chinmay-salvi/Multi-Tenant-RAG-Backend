@@ -207,13 +207,33 @@ async def get_url_data(user_id, group_id, main_url, page_url):
 
 
 async def fetch_urls_recursive(main_url: str, user_id: UUID, group_id: UUID) -> Dict:
+    """
+    Crawls and scrapes URLs recursively up to the max depth (SCRAPER_MAX_DEPTH).
+
+    This function does the following:
+    1. Uses a breadth-first search (BFS) queue populated with URL targets.
+    2. Runs batch requests concurrently (up to MAX_CONCURRENT_TASKS) to retrieve markdown data.
+    3. Handles temporary server blocks or rate limits by dynamically adjusting concurrent limits.
+    4. Identifies paginated links to dynamically support crawling paginated content.
+    5. Deduplicates URLs to prevent recursive infinite loops.
+
+    Args:
+        main_url (str): The landing domain or specific URL target to crawl.
+        user_id (UUID): The user ID triggering this crawl.
+        group_id (UUID): The group ID grouping crawled URLs together.
+
+    Returns:
+        Dict: A mapping of cleaned URL strings to their parsed scraped metadata.
+    """
     urls_data = dict()
+    # BFS queue initialized with the main landing page URL
     urls_q = deque([clean_url(main_url)])
     depth = 0
     pagination_found = retries = False
     retried_urls = defaultdict(int)
     limit_errors = 10**9
 
+    # BFS traversal loop restricted by depth and outstanding retries
     while depth < SCRAPER_MAX_DEPTH or pagination_found or retries:
         new_urls_set = set()
         pagination_found = retries = False
@@ -222,18 +242,21 @@ async def fetch_urls_recursive(main_url: str, user_id: UUID, group_id: UUID) -> 
             tasks = []
             error_task_count = 0
 
+            # Batch dynamic tasks to prevent excessive concurrency
             for _ in range(min(limit_errors, MAX_CONCURRENT_TASKS, len(urls_q))):
                 page_url = urls_q.popleft()
                 tasks.append(get_url_data(user_id, group_id, main_url, page_url))
 
+            # Execute batch scrapes in parallel
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for result in results:
-
+                # Handle error responses from third-party scraper API (Jina Reader)
                 if isinstance(result, Exception):
                     key = clean_url(result.args[1])
                     print(f"Error: {result} -- retry count: {retried_urls[key]}")
 
+                    # Limit retry attempts to 2 per URL
                     if retried_urls[key] == 2:
                         continue
 
@@ -249,10 +272,12 @@ async def fetch_urls_recursive(main_url: str, user_id: UUID, group_id: UUID) -> 
                     if key in new_urls_set:
                         new_urls_set.remove(key)
 
+                    # Extract nested links for recursive indexing
                     for link in links:
                         if not link.startswith("http"):
                             continue
 
+                        # Dynamic pagination validation check
                         if check_pagination(link):
                             pagination_found = True
                         elif depth >= SCRAPER_MAX_DEPTH - 1:
@@ -263,25 +288,34 @@ async def fetch_urls_recursive(main_url: str, user_id: UUID, group_id: UUID) -> 
                         if link in retried_urls and retried_urls[link] == 2:
                             continue
 
+                        # Add new unvisited links to the traversal set
                         if link not in urls_data:
                             new_urls_set.add(link)
 
+            # If rate-limiting blocks are detected, execute back-off cooldown
             if error_task_count >= len(results) // 2:
                 limit_errors = 5
                 await asyncio.sleep(random.randint(60, 70))
             else:
                 limit_errors = 10**9
 
+        # Populate queue with newly discovered and filtered URLs
         urls_q = deque(new_urls_set.difference(urls_data.keys()))
         depth += 1
 
     return urls_data
 
 
-async def poll_and_process_scraping_messages(task_num):
-    while True:
-        # logger.info(f"Running Task No.: {task_num}")
+async def poll_and_process_scraping_messages(task_num: int):
+    """
+    Continuous background worker loop that polls and processes pending URL crawling requests.
 
+    Polled elements are secured via row locks to support concurrent background workers.
+
+    Args:
+        task_num (int): Identifier for this background worker thread.
+    """
+    while True:
         async with SessionLocal() as session:
             # Fetch the oldest pending message from the queue
             message = await session.scalar(

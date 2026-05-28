@@ -26,8 +26,23 @@ async def save_lead_form(
     token_payload: dict = Depends(validate_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Saves or updates the lead form template configurations for a specific chatbot.
+
+    If any structural elements (keys, labels, input types, etc.) are modified, a versioned
+    new `LeadForm` template record is created in the database to maintain schema integrity
+    for historical lead records matching older form templates.
+
+    Args:
+        body (SaveLeadFormRequest): Custom lead form configurations (title, keys, inputs, quotas).
+        token_payload (dict): Extracted, validated tenant JWT credentials.
+        db (AsyncSession): SQLAlchemy active database session.
+
+    Returns:
+        dict: A JSON response containing 'success' and 'message' descriptions.
+    """
     try:
-        # Ensure the user exists
+        # Assert identity: Validate user exists under tenant
         await fetch_existing_user(
             org_id=token_payload["orgId"],
             user_id=token_payload["userId"],
@@ -35,7 +50,7 @@ async def save_lead_form(
             ensure=True,
         )
 
-        # Fetch the chatbot
+        # Retrieve the chatbot scoped to the tenant organization
         chatbot = await fetch_chatbot_lead_form(
             org_id=token_payload["orgId"], chatbot_id=body.chatbotId, db=db
         )
@@ -43,12 +58,13 @@ async def save_lead_form(
         if not chatbot:
             return {"success": False, "message": "Chatbot does not exist"}
 
+        # Toggle Lead Form visibility status
         chatbot.isLeadFormEnabled = body.isLeadFormEnabled
 
-        # Update or create lead form template if necessary
         new_form_required = False
 
         if body.isLeadFormEnabled:
+            # Enforce schema consistency across structural parameters
             if not (
                 len(body.leadFormKeys)
                 and len(body.leadFormKeys)
@@ -57,6 +73,7 @@ async def save_lead_form(
             ):
                 return {"success": False, "message": "Invalid input."}
 
+            # Determine if a versioned new template row is required due to updates
             if not chatbot.latestLeadForm:
                 new_form_required = True
             else:
@@ -69,6 +86,7 @@ async def save_lead_form(
                     or chatbot.latestLeadForm.maxShowLimit != body.maxShowLimit
                 )
 
+        # If structural changes are identified, insert a versioned new LeadForm row
         if new_form_required:
             new_form = LeadForm(
                 leadFormId=uuid4(),
@@ -81,6 +99,7 @@ async def save_lead_form(
                 chatbotId=chatbot.chatbotId,
                 orgId=chatbot.orgId,
             )
+            # Route active relations to the new template ID
             chatbot.latestLeadForm = new_form
             chatbot.latestLeadFormId = new_form.leadFormId
             db.add(new_form)
@@ -99,17 +118,33 @@ async def save_lead(
     body: SaveLeadRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Saves a customer's submitted lead form response.
+
+    This public route validates that the submitted keys and labels precisely match
+    the active version of the chatbot's `LeadForm` template before mapping submitted values
+    into a dynamic PostgreSQL JSONB data column.
+
+    Args:
+        body (SaveLeadRequest): The raw field values submitted by the client chatbot widget.
+        db (AsyncSession): SQLAlchemy active database session.
+
+    Returns:
+        dict: A JSON response containing 'success' and 'message' descriptions.
+    """
     try:
-        # Fetch the chatbot along with lead form
+        # Retrieve target chatbot and the active template configuration
         chatbot = await fetch_chatbot_lead_form(chatbot_id=body.chatbotId, db=db)
 
         if not chatbot:
             return {"success": False, "message": "Chatbot does not exist"}
 
+        # Validate that Lead Form features are enabled
         if not (chatbot.isLeadFormEnabled and chatbot.latestLeadForm):
             return {"success": False, "message": "Functionality not available."}
 
         form = chatbot.latestLeadForm
+        # Ensure parity between template length and submitted value length
         if not (
             body.leadFormKeys
             and len(body.leadFormKeys)
@@ -121,11 +156,13 @@ async def save_lead(
 
         data = dict()
 
+        # Map dynamic inputs to DB keys while maintaining security matches
         for index, (key, label) in enumerate(zip(form.keys, form.labels)):
             if body.leadFormKeys[index] != key or body.leadFormLabels[index] != label:
                 return {"success": False, "message": "Invalid input."}
             data[key] = body.leadFormValues[index]
 
+        # Insert lead values into the Lead database table
         db.add(
             Lead(
                 leadFormId=form.leadFormId,
@@ -160,6 +197,27 @@ async def retrieve_leads(
     token_payload: dict = Depends(validate_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Retrieves all captured customer lead responses scoped to a specific chatbot and date range.
+
+    This function does the following:
+    1. Validates that the requesting user exists within the organization tenant scope.
+    2. Performs timezone-agnostic datetimes parsing.
+    3. Queries all Lead records and maps dynamic JSONB data back into keys and values arrays
+       matching the active LeadForm template definition.
+
+    Args:
+        userId (UUID): The requesting user ID.
+        chatbotId (UUID): Target chatbot ID.
+        fromDate (datetime, optional): Timeframe beginning filter.
+        toDate (datetime, optional): Timeframe end filter.
+        token_payload (dict): Decoded and verified tenant token.
+        db (AsyncSession): Active database session.
+
+    Returns:
+        dict: A JSON response containing status details and the list of serialized leads.
+    """
+    # Assert requesting user belongs to the tenant
     _ = await fetch_existing_user(
         org_id=token_payload["orgId"],
         user_id=token_payload["userId"],
@@ -167,10 +225,12 @@ async def retrieve_leads(
         ensure=True,
     )
 
+    # Perform timezone-agnostic replacements
     from_date = fromDate.replace(tzinfo=None) if fromDate.tzinfo else fromDate
     to_date = toDate.replace(tzinfo=None) if toDate.tzinfo else toDate
 
     try:
+        # Fetch active leads matching date filters
         leads = await fetch_leads(
             org_id=token_payload["orgId"],
             chatbot_id=chatbotId,
@@ -195,7 +255,7 @@ async def retrieve_leads(
             ],
         }
     except Exception as e:
-        # Rollback in case of any error
+        # Rollback database changes on failure
         await db.rollback()
         print("An unexpected error occurred while fetching leads:", e)
         return {
