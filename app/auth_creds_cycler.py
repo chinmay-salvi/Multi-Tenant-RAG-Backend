@@ -3,7 +3,7 @@ import datetime
 import logging
 import random
 from typing import Dict
-
+import json
 from app.user_org.crud import fetch_random_auth_cred
 from app.core.config import AUTH_CRED_REFRESH_MINUTES
 from app.db.session import SessionLocal
@@ -64,7 +64,7 @@ class AuthCredsCircularArray:
                         db=session, auth_cred_type=self.auth_cred_type
                     )
                     # Convert raw string rows (eval-safe serialized JSON dictionary strings) to Python dictionaries
-                    self.data = [eval(record) for record in records]
+                    self.data = [json.loads(record) for record in records]
 
                 # Randomize order to load-balance across API keys
                 random.shuffle(self.data)
