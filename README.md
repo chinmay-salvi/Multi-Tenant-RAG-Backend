@@ -1,27 +1,31 @@
 # Backend Agents
 
-Backend service for a no-code AI chatbot platform. Organizations build configurable chatbots grounded in custom knowledge (datafeeds), deploy them via widgets or managed channels, and handle conversations, leads, support tickets, and billing through a unified FastAPI API.
+Backend service for a no-code AI chatbot platform. Organizations build configurable chatbots grounded in custom knowledge (datafeeds), deploy them via widgets or managed channels, and handle conversations, leads, support tickets, and billing through a unified domain-driven FastAPI API.
 
 ## Features
 
-- **Multi-tenant chatbots** — Organizations, users, tags, and per-chatbot configuration (purpose, company context, intro messages, branding).
-- **Retrieval-augmented chat (RAG)** — Answers are grounded in embedded datafeeds stored in PostgreSQL with **pgvector**.
-- **Streaming responses** — Real-time assistant replies over **Server-Sent Events (SSE)** with subprocess metadata for transparency.
-- **Conversation memory** — Full message history persisted per conversation; recent turns plus **query condensation** keep follow-up questions coherent in longer threads.
-- **Knowledge ingestion** — Upload text/files, scrape URLs, and background workers for embedding and scraping pipelines.
-- **Managed backend integration** — Webhook-style messaging for external inbox platforms with optional human handoff.
-- **Leads & support** — Capture lead forms, ticket submission, and status workflows.
-- **Plans & payments** — Trial and subscription limits with **Razorpay** webhook handling.
+* **Domain-Driven Modular Architecture** — Clean, scalable code structure separated by business domains (Chatbots, Messaging, Ticketing, Leads, Billing, Datafeeds).
+* **Multi-tenant chatbots** — Organizations, users, tags, and per-chatbot configuration (purpose, company context, intro messages, branding).
+* **Retrieval-augmented chat (RAG)** — Answers are grounded in embedded datafeeds stored in PostgreSQL with **pgvector**.
+* **Non-Blocking Real-time Streaming** — Real-time assistant replies over **Server-Sent Events (SSE)** with subprocess metadata, utilizing non-blocking EAFP exception-based stream state handling.
+* **Coherent Conversation Memory** — Full message history persisted per conversation; recent turns plus **query condensation** keep follow-up questions coherent in longer threads.
+* **Enterprise Concurrency Protection** — Implements atomic parent counters (`lastTicketSequence` on `Organization`) ensuring gapless support ticket sequence numbers under concurrent threads.
+* **Knowledge Ingestion** — Upload text/files, scrape URLs, and background workers for embedding and scraping pipelines, offloaded cleanly to asynchronous execution.
+* **Managed Backend Integration** — Fully asynchronous webhook-style messaging for external inbox platforms using `httpx` for high-frequency concurrency, featuring automatic human handoff triggers.
+* **Plans & Payments** — Active usage limit guardrails (chatbot counts, message volumes, datafeed token sizes) offloaded to threadpools (`asyncio.to_thread`) to prevent blocking the FastAPI event loop.
+
+---
 
 ## Architecture
 
 ```
 ┌─────────────┐     ┌──────────────────────────────────────────────────┐
 │   Client    │────▶│  FastAPI (nginx)  /api/v1/*                      │
-│  (widget)   │     │  • Auth (Supabase JWT)                           │
-└─────────────┘     │  • Chatbots, conversations, messages (SSE)       │
-                    │  • Datafeeds, leads, tickets, payments          │
-                    └───────────┬──────────────────────┬───────────────┘
+│  (widget)   │     │  • Domain-Driven Modularity (app/*)              │
+│             │     │  • Auth (Supabase JWT)                           │
+│             │     │  • Async Webhook Messaging (httpx)               │
+│             │     │  • Non-blocking limit verification               │
+└─────────────┘     └───────────┬──────────────────────┬───────────────┘
                                 │                      │
                     ┌───────────▼──────────┐  ┌────────▼────────────┐
                     │  PostgreSQL +        │  │  S3 (file uploads)  │
@@ -47,34 +51,48 @@ Backend service for a no-code AI chatbot platform. Organizations build configura
 
 Supported LLM/embed paths include **Groq** and **OpenAI**, with **Cloudflare Workers AI** embeddings. Credentials for external APIs are rotated via `SysAuthCred` and `auth_creds_cycler`.
 
-## Project structure
+---
+
+## Project Structure
+
+The codebase is organized using a **modular, domain-driven architecture** where each folder under `app/` is self-contained with its own API routers, schemas, CRUD helpers, and business services.
 
 ```
 backend-agents-main/
 ├── app/                          # Main FastAPI application
-│   ├── api/endpoints/            # REST routers (chatbot, message, datafeed, …)
-│   ├── chat/                     # RAG, agents, streaming callbacks
-│   ├── core/config.py            # Environment configuration
-│   ├── db/                       # SQLAlchemy models, sessions, pgvector
+│   ├── chatbot/                  # Chatbot design, branding, and active configurations
+│   ├── message/                  # Streaming engines (RAG), conversation history, managed inbox
+│   ├── datafeed/                 # File ingestion, URL scraping, and raw knowledge loaders
+│   ├── ticket/                   # Support ticketing (atomic sequence generation)
+│   ├── lead/                     # Custom lead forms and captured contact templates
+│   ├── payments/                 # Plans, billing limits, and payment validation (threadpool offloaded)
+│   ├── user_org/                 # Multi-tenant registrations and rotated credential cyclers
+│   ├── core/                     # Application configurations (config.py, dependencies)
+│   ├── utils/                    # Shared utilities (S3 helpers, formatters)
 │   ├── backend_app.py            # App entrypoint
 │   └── requirements.txt
-├── datafeed_processing/          # Background embed & scrape workers
-├── docker-compose.yml            # App + Postgres (pgvector) + nginx
-├── datafeed-docker-compose.yml   # Embed and scrape worker services
+├── datafeed_processing/          # Standalone background embed & scrape workers
+├── docker-compose.yml            # App + Postgres (pgvector) + nginx stack
+├── datafeed-docker-compose.yml   # Embed and scrape worker services stack
 └── commands.txt                  # Local dev quick reference
 ```
 
-## Tech stack
+---
+
+## Tech Stack
 
 | Layer | Technology |
 |--------|------------|
-| API | FastAPI, Uvicorn, SSE (sse-starlette) |
-| ORM / DB | SQLAlchemy (async), PostgreSQL, pgvector |
-| RAG | LlamaIndex (CondensePlusContextChatEngine, VectorStoreIndex) |
-| Auth | Supabase |
-| Storage | AWS S3 |
-| Payments | Razorpay webhooks |
-| Workers | Dockerized embed/scrape services |
+| **API Framework** | FastAPI, Uvicorn, SSE (`sse-starlette`) |
+| **ORM / Database** | SQLAlchemy (async), PostgreSQL, pgvector |
+| **RAG Engine** | LlamaIndex (CondensePlusContextChatEngine, VectorStoreIndex) |
+| **Authentication** | Supabase JWT |
+| **Outbound HTTP** | Non-blocking `httpx` AsyncClient (webhook dispatching) |
+| **File Storage** | AWS S3 Integration |
+| **Payments** | Razorpay webhooks |
+| **Worker Queues** | Dockerized embed & URL scrape workers (with skip_locked locks) |
+
+---
 
 ## Prerequisites
 
@@ -82,6 +100,8 @@ backend-agents-main/
 - PostgreSQL 16 with **pgvector**
 - Supabase project (auth + `user_org` table)
 - API keys: Groq and/or OpenAI, Cloudflare Workers AI embeddings, AWS S3 (optional), Razorpay (optional)
+
+---
 
 ## Configuration
 
@@ -99,7 +119,9 @@ Set environment variables (or extend `app/core/config.py`). Common settings:
 | `MANAGED_BACKEND` | External managed inbox base URL |
 | `VECTOR_STORE_TABLE_NAME` | pgvector table name (default: `pg_vector_store`) |
 
-## Local development
+---
+
+## Local Development
 
 From the repository root:
 
@@ -119,6 +141,8 @@ python -m uvicorn backend_app:app --reload --host 0.0.0.0 --port 8000
 
 Tables are created automatically on startup via `wait_for_db` when the database is reachable.
 
+---
+
 ## Docker
 
 **Application stack** (API, database, reverse proxy):
@@ -133,7 +157,9 @@ docker compose up --build
 docker compose -f datafeed-docker-compose.yml up --build
 ```
 
-## API overview
+---
+
+## API Overview
 
 All routes are under `/api/v1` unless noted. Authenticated routes expect `Authorization: Bearer <supabase_access_token>`.
 
@@ -150,25 +176,7 @@ All routes are under `/api/v1` unless noted. Authenticated routes expect `Author
 
 Public chatbots can accept messages without a user token when `isPublic` is set; private bots require authentication.
 
-## Datafeeds
-
-Knowledge sources are attached to chatbots and embedded into the shared vector index:
-
-- **Text** — Direct paste/upload.
-- **Files** — PDF, DOCX, JSON, TXT (stored in S3, processed by the embed worker).
-- **URLs** — Submitted for scraping; selected pages are parsed and embedded.
-
-Chunks use a configurable size (`NODE_PARSER_CHUNK_SIZE`, default 512) and overlap. Retrieval applies metadata filters so each chatbot only sees its org’s relevant nodes.
-
-## Conversations & memory
-
-- Every turn is stored as a `Message` with role, content, status, and optional **sub-processes** (e.g. query engine construction).
-- For generation, recent conversation turns are passed into the chat engine together with **condensation** so short follow-ups (“what about pricing?”) become self-contained questions.
-- Intro messages are seeded automatically on the first user message in a new conversation.
-
-## Plans & usage
-
-Organizations are associated with trial or Razorpay subscription plans. Usage checks cover chatbot counts, message volume, and datafeed token utilization against plan limits stored in Supabase-cached plan data.
+---
 
 ## License
 
