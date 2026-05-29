@@ -2,23 +2,23 @@ import logging
 from uuid import UUID
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from app import schema
-from app.api.crud_helper import (
+
+from app.core.deps import get_db
+from app.auth import validate_user
+from app.db.tables import Tag
+from .schemas import TagsAdd
+from .crud import (
     fetch_existing_user,
     fetch_existing_tag,
     fetch_all_tags_for_org,
 )
-from app.api.deps import get_db
-from app.auth import validate_user
-from app.db.tables import Tag
-
 
 logger = logging.getLogger(__name__)
 
-tags_router = APIRouter()
+user_org_router = APIRouter()
 
 
-@tags_router.get("/get_tag_data")
+@user_org_router.get("/get_tag_data")
 async def get_tag_data(
     userId: UUID,
     token_payload: dict = Depends(validate_user),
@@ -51,9 +51,9 @@ async def get_tag_data(
     }
 
 
-@tags_router.post("/add_tag")
+@user_org_router.post("/add_tag")
 async def add_tag(
-    body: schema.TagsAdd,
+    body: TagsAdd,
     token_payload: dict = Depends(validate_user),
     db: AsyncSession = Depends(get_db),
 ) -> str:
@@ -63,7 +63,7 @@ async def add_tag(
     Enforces tag name uniqueness scoped per tenant to prevent collisions.
 
     Args:
-        body (schema.TagsAdd): Struct containing tag name parameters.
+        body (TagsAdd): Struct containing tag name parameters.
         token_payload (dict): Decoded and verified tenant token.
         db (AsyncSession): Active database session.
 

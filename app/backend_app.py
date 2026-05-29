@@ -2,7 +2,7 @@ import sys
 import uvicorn
 import logging
 from llama_index.core.node_parser.text.utils import split_by_sentence_tokenizer
-from app.api.api import api_router
+from app.api import api_router
 from app.db.wait_for_db import check_database_connection, create_tables_if_not_exists
 from app.core.config import PROJECT_NAME, LOG_LEVEL, API_PREFIX, WORKERS
 from contextlib import asynccontextmanager

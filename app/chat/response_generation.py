@@ -31,14 +31,14 @@ from llama_index.embeddings.cloudflare_workersai import CloudflareEmbedding
 from llama_index.llms.groq import Groq
 from llama_index.llms.openai import OpenAI
 
-from app.api.managed_backend_helper import change_conversation_status
+from app.message.managed_backend_helper import change_conversation_status
 from app.chat.custom_agent import OpenAIAgent
 
 # from llama_index.core.memory import ChatSummaryMemoryBuffer
 # from llama_index.core.memory import ChatMemoryBuffer
 # from app.chat.custom_llm import CustomLLM
 
-from app import schema
+from app.message import schemas as schema
 from app.auth_creds_cycler import get_auth_creds
 from app.chat.callback_handling import ChatCallbackHandler
 from app.core.config import (

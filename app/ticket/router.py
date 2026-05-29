@@ -14,19 +14,23 @@ from fastapi import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import schema
-from app.api.crud_helper import (
-    fetch_chatbot_directly,
-    fetch_existing_user,
+from app.core.deps import get_db
+from app.utils.s3_helper import upload_file_to_s3
+from app.auth import validate_user
+from app.db.tables import Tickets
+from app.user_org.crud import fetch_existing_user
+from app.chatbot.crud import fetch_chatbot_directly
+
+from .schemas import (
+    TicketStatusChangeRequest,
+    TicketUsingEmailRequest,
+    TicketUsingEmailResponse,
+)
+from .crud import (
     fetch_tickets,
     fetch_ticket,
     fetch_customer_tickets_email,
 )
-from app.api.deps import get_db
-from app.api.s3_helper import upload_file_to_s3
-from app.auth import validate_user
-from app.db.tables import Tickets
-from app.schema import TicketStatusChangeRequest
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +257,7 @@ async def change_ticket_status(
 
 @ticket_router.post("/ticket_data_using_email")
 async def get_ticket_data_using_email(
-    body: schema.TicketUsingEmailRequest,
+    body: TicketUsingEmailRequest,
     token_payload: dict = Depends(validate_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -264,12 +268,12 @@ async def get_ticket_data_using_email(
     associated with a specific client email within their tenant environment.
 
     Args:
-        body (schema.TicketUsingEmailRequest): Target email string to query.
+        body (TicketUsingEmailRequest): Target email string to query.
         token_payload (dict): Decoded and verified tenant JWT.
         db (AsyncSession): Active database session.
 
     Returns:
-        dict: A JSON response conforming to 'TicketUsingEmailResponse' schema.
+        TicketUsingEmailResponse: conformant object containing support history
     """
     # Assert requesting user belongs to the tenant organization
     _ = await fetch_existing_user(
@@ -290,7 +294,7 @@ async def get_ticket_data_using_email(
     if customer_tickets:
         try:
             # Return serialized digest of matching support history
-            return schema.TicketUsingEmailResponse(
+            return TicketUsingEmailResponse(
                 name=customer_tickets[-1].name,
                 email=body.email,
                 userProfilePicUrl="https://github.com/shadcn.png",

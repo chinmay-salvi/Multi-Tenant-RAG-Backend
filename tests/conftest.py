@@ -120,15 +120,23 @@ def _mock_external_services(monkeypatch: pytest.MonkeyPatch) -> None:
     not only the defining module in ``plans_helper``.
     """
     monkeypatch.setattr(
-        "app.api.endpoints.datafeed.check_datafeed_token_limit",
+        "app.datafeed.router.check_datafeed_token_limit",
         _noop_plan_check,
     )
     monkeypatch.setattr(
-        "app.api.endpoints.chatbot.check_chatbot_limit",
+        "app.datafeed.services.check_datafeed_token_limit",
         _noop_plan_check,
     )
     monkeypatch.setattr(
-        "app.api.plans_helper.fetch_plan_data",
+        "app.chatbot.router.check_chatbot_limit",
+        _noop_plan_check,
+    )
+    monkeypatch.setattr(
+        "app.chatbot.services.check_chatbot_limit",
+        _noop_plan_check,
+    )
+    monkeypatch.setattr(
+        "app.payments.plans_helper.fetch_plan_data",
         lambda org_id: {
             "razorpay_subscriptions": [],
             "user_trial": [
@@ -149,21 +157,33 @@ def _mock_external_services(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _fake_get_limits(org_id: str) -> tuple[int, int]:
         return 10_000, 1_000_000
 
-    monkeypatch.setattr("app.api.endpoints.datafeed.get_limits", _fake_get_limits)
+    monkeypatch.setattr("app.datafeed.router.get_limits", _fake_get_limits)
 
     async def _fake_s3_upload(uploaded_file_path: str, s3_key: str) -> str:
         return f"https://test-bucket.s3.amazonaws.com/{s3_key}"
 
     monkeypatch.setattr(
-        "app.api.endpoints.datafeed.upload_file_to_s3",
+        "app.datafeed.router.upload_file_to_s3",
         _fake_s3_upload,
     )
     monkeypatch.setattr(
-        "app.api.endpoints.chatbot.upload_file_to_s3",
+        "app.datafeed.services.upload_file_to_s3",
         _fake_s3_upload,
     )
     monkeypatch.setattr(
-        "app.api.endpoints.chatbot.modify_chatbot_id_in_nodes",
+        "app.chatbot.router.upload_file_to_s3",
+        _fake_s3_upload,
+    )
+    monkeypatch.setattr(
+        "app.chatbot.services.upload_file_to_s3",
+        _fake_s3_upload,
+    )
+    monkeypatch.setattr(
+        "app.chatbot.router.modify_chatbot_id_in_nodes",
+        lambda org_id, chatbot_id, remove_datafeeds, additional_datafeeds: True,
+    )
+    monkeypatch.setattr(
+        "app.chatbot.services.modify_chatbot_id_in_nodes",
         lambda org_id, chatbot_id, remove_datafeeds, additional_datafeeds: True,
     )
 

@@ -1,21 +1,22 @@
 from datetime import MAXYEAR, MINYEAR, datetime
 import logging
 from uuid import UUID, uuid4
-from app.schema import SaveLeadFormRequest, SaveLeadRequest
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.api.crud_helper import (
-    fetch_existing_user,
+
+from app.core.deps import get_db
+from app.auth import validate_user
+from app.db.tables import LeadForm, Lead
+from app.user_org.crud import fetch_existing_user
+
+from .schemas import SaveLeadFormRequest, SaveLeadRequest
+from .crud import (
     fetch_chatbot_lead_form,
     fetch_leads,
 )
-from app.api.deps import get_db
-from app.auth import validate_user
-from app.db.tables import LeadForm, Lead
-
 
 logger = logging.getLogger(__name__)
-
 
 lead_router = APIRouter()
 

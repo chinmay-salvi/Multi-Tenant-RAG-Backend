@@ -4,7 +4,7 @@ import logging
 import random
 from typing import Dict
 
-from app.api.crud_helper import fetch_random_auth_cred
+from app.user_org.crud import fetch_random_auth_cred
 from app.core.config import AUTH_CRED_REFRESH_MINUTES
 from app.db.session import SessionLocal
 

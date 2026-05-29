@@ -9,7 +9,7 @@ from llama_index.core.callbacks import CBEventType, EventPayload
 from llama_index.core.callbacks.base import BaseCallbackHandler
 from llama_index.core.query_engine import SubQuestionAnswerPair
 
-from app import schema
+from app.message import schemas as schema
 
 
 logger = logging.getLogger(__name__)

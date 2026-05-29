@@ -1,14 +1,15 @@
 import hashlib
 import hmac
 import json
+import logging
 from datetime import datetime
 
-from fastapi import APIRouter
-from fastapi import Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from app.core.config import RAZORPAY_WEBHOOK_SECRET
 from app.db.supabase import supabase_client
 
+logger = logging.getLogger(__name__)
 
 payments_router = APIRouter()
 
@@ -36,21 +37,6 @@ def verify_signature(payload: str, signature: str, secret: str) -> bool:
 class RazorpayWebhook(BaseModel):
     event: str
     payload: dict
-
-
-# Define the relevant Stripe events
-relevant_events = {
-    "product.created",
-    "product.updated",
-    "product.deleted",
-    "price.created",
-    "price.updated",
-    "price.deleted",
-    "checkout.session.completed",
-    "customer.subscription.created",
-    "customer.subscription.updated",
-    "customer.subscription.deleted",
-}
 
 
 @payments_router.post("/razorpay_webhook")

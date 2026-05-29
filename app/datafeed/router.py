@@ -6,24 +6,9 @@ import aiofiles
 from fastapi import APIRouter, Depends, UploadFile, Form, File, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.crud_helper import (
-    fetch_existing_tag,
-    fetch_existing_user,
-    fetch_datafeeds_with_tags,
-    fetch_datafeeds_by_ids,
-    fetch_chatbot_datafeeds,
-    fetch_datafeed_tags,
-    fetch_data_feed_embedding_message_directly,
-    fetch_url_datafeed_by_ids,
-    delete_url_datafeed_group,
-    fetch_url_scraping_message,
-    fetch_scraped_urls,
-    count_token_utilization,
-)
-from app.api.datafeed_helper import delete_nodes
-from app.api.deps import get_db
-from app.api.plans_helper import check_datafeed_token_limit, get_limits
-from app.api.s3_helper import upload_file_to_s3
+from app.core.deps import get_db
+from app.payments.plans_helper import check_datafeed_token_limit, get_limits
+from app.utils.s3_helper import upload_file_to_s3
 from app.auth import validate_user
 from app.db.tables import (
     DataFeedDataTypeEnum,
@@ -35,7 +20,11 @@ from app.db.tables import (
     MessageQueueStatusEnum,
     URLScrapingMessageQueue,
 )
-from app.schema import (
+from app.user_org.crud import fetch_existing_user, fetch_existing_tag
+
+from app.chatbot.crud import fetch_chatbot_datafeeds
+
+from .schemas import (
     TextDataUploadRequest,
     TextOrFileUploadResponse,
     ScrapeURLRequest,
@@ -47,6 +36,23 @@ from app.schema import (
     DataFeedResponse,
     GetDataFeedResponse,
     DeleteDataFeedRequest,
+)
+from .crud import (
+    fetch_datafeeds_with_tags,
+    fetch_datafeeds_by_ids,
+    fetch_datafeed_tags,
+    fetch_data_feed_embedding_message_directly,
+    fetch_url_datafeed_by_ids,
+    delete_url_datafeed_group,
+    fetch_url_scraping_message,
+    fetch_scraped_urls,
+    count_token_utilization,
+)
+from .datafeed_helper import delete_nodes
+from .services import (
+    process_text_upload,
+    process_file_upload,
+    process_urls_ingestion,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,22 +68,6 @@ async def text_data_upload(
 ):
     """
     Ingests dynamic text input as a grounding datafeed for RAG query processing.
-
-    This function does the following:
-    1. Asserts identity validation to verify the user belongs to the tenant org.
-    2. Runs quota checking routines against total token usage limits for this tenant.
-    3. Saves text data to a local temporary file, then uploads it asynchronously to S3.
-    4. Records the datafeed configuration row mapping metadata inside the DB table.
-    5. Inserts an indexing record in the background Embedding Queue (`DataFeedEmbeddingMessageQueue`)
-       so background workers can split the text and create pgvector embeddings.
-
-    Args:
-        body (TextDataUploadRequest): Struct containing raw text string, target tag, and requesting user parameters.
-        token_payload (dict): Decoded and verified tenant JWT details.
-        db (AsyncSession): Active SQLAlchemy database session.
-
-    Returns:
-        TextOrFileUploadResponse: Response indicating upload status along with tag and datafeed IDs.
     """
     # Assert identity mapping
     _ = await fetch_existing_user(
@@ -87,70 +77,11 @@ async def text_data_upload(
         ensure=True,
     )
 
-    # Assert plan token limitations
-    utilized_tokens = await count_token_utilization(token_payload["orgId"], db)
-    message = check_datafeed_token_limit(token_payload["orgId"], utilized_tokens)
-
-    if message:
-        return TextOrFileUploadResponse(
-            success=False,
-            message=message,
-            dataFeedId=None,
-            tagId=None,
-        )
-
-    # Fetch or auto-create tag configurations
-    existing_tag = await fetch_existing_tag(
-        tag=body.selectedTag, org_id=token_payload["orgId"], db=db, ensure=True
-    )
-
-    tag_id = existing_tag.tagId
-    data_feed_id = uuid4()
-
-    # Save text data to a temporary file
-    temp_filename = f"{data_feed_id}.txt"
-    with open(temp_filename, "w") as temp_file:
-        temp_file.write(body.text)
-
-    # Upload the file to S3 using the async function
-    s3_url = await upload_file_to_s3(
-        uploaded_file_path=temp_filename,
-        s3_key=f"{token_payload['orgId']}/datafeeds/{temp_filename}",
-    )
-
-    # Clean up the temporary file
-    os.remove(temp_filename)
-
-    # Record datafeed row inside database
-    db.add(
-        DataFeed(
-            dataFeedId=data_feed_id,
-            dataFeedName=body.text[:20],
-            dataType=DataFeedDataTypeEnum.Text,
-            dataFeedURL=s3_url,
-            orgId=token_payload["orgId"],
-        )
-    )
-    db.add(DataFeedTag(dataFeedId=data_feed_id, tagId=tag_id))
-    # Push job metadata to Embedding Queue for background processing
-    db.add(
-        DataFeedEmbeddingMessageQueue(
-            dataFeedId=data_feed_id,
-            dataFeedName=body.text[:20],
-            messageStatus=MessageQueueStatusEnum.PENDING,
-            dataType=DataFeedDataTypeEnum.Text,
-            dataFeedURL=s3_url,
-            orgId=token_payload["orgId"],
-        )
-    )
-    await db.commit()
-
-    # Return a successful response
-    return TextOrFileUploadResponse(
-        success=True,
-        message="Data feed along with provided tag uploaded successfully",
-        dataFeedId=data_feed_id,
-        tagId=tag_id,
+    return await process_text_upload(
+        db=db,
+        org_id=token_payload["orgId"],
+        text=body.text,
+        selected_tag=body.selectedTag,
     )
 
 
@@ -164,25 +95,6 @@ async def upload_file(
 ):
     """
     Ingests files (PDF, DOCX, JSON, TXT) as grounding datafeeds for RAG query processing.
-
-    This function does the following:
-    1. Asserts identity validation to verify the user belongs to the tenant org.
-    2. Runs quota checking routines against total token usage limits for this tenant.
-    3. Asserts that the uploaded file type is supported.
-    4. Saves the file to a local temporary location, then uploads it asynchronously to S3.
-    5. Records the datafeed configuration row mapping metadata inside the DB table.
-    6. Inserts an indexing record in the background Embedding Queue (`DataFeedEmbeddingMessageQueue`)
-       so background workers can parse, chunk, and embed the file contents.
-
-    Args:
-        file (UploadFile): The binary file uploaded by the client.
-        userId (UUID): The requesting user ID.
-        selectedTag (str): The tag associated with this datafeed.
-        token_payload (dict): Decoded and verified tenant JWT details.
-        db (AsyncSession): Active SQLAlchemy database session.
-
-    Returns:
-        TextOrFileUploadResponse: Response indicating upload status along with tag and datafeed IDs.
     """
     if userId != UUID(token_payload["userId"]):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -194,85 +106,11 @@ async def upload_file(
         ensure=True,
     )
 
-    utilized_tokens = await count_token_utilization(token_payload["orgId"], db)
-    message = check_datafeed_token_limit(token_payload["orgId"], utilized_tokens)
-
-    if message:
-        return TextOrFileUploadResponse(
-            success=False,
-            message=message,
-            dataFeedId=None,
-            tagId=None,
-        )
-
-    file_extension = file.filename.split(".")[-1].upper()
-
-    # Map the file extension to the corresponding file type enum value
-    if file_extension == "PDF":
-        file_type = DataFeedFileTypeEnum.PDF
-    elif file_extension == "DOCX":
-        file_type = DataFeedFileTypeEnum.DOCX
-    elif file_extension == "JSON":
-        file_type = DataFeedFileTypeEnum.JSON
-    elif file_extension == "TXT":
-        file_type = DataFeedFileTypeEnum.TXT
-    else:
-        raise HTTPException(
-            status_code=415, detail=f"Unsupported file type: {file_extension}"
-        )
-
-    existing_tag = await fetch_existing_tag(
-        tag=selectedTag, org_id=token_payload["orgId"], db=db, ensure=True
-    )
-
-    tag_id = existing_tag.tagId
-    data_feed_id = uuid4()
-
-    # Save the uploaded file to a temporary location
-    temp_filename = f"{data_feed_id}.{file_extension.lower()}"
-    async with aiofiles.open(temp_filename, "wb") as temp_file:
-        content = await file.read()
-        await temp_file.write(content)
-
-    # Upload the file to S3 using the async function
-    s3_url = await upload_file_to_s3(
-        uploaded_file_path=temp_filename,
-        s3_key=f"{token_payload['orgId']}/datafeeds/{temp_filename}",
-    )
-
-    # Clean up the temporary file
-    os.remove(temp_filename)
-
-    db.add(
-        DataFeed(
-            dataFeedId=data_feed_id,
-            dataFeedName=file.filename,
-            dataType=DataFeedDataTypeEnum.File,
-            dataFeedURL=s3_url,
-            fileType=file_type,
-            orgId=token_payload["orgId"],
-        )
-    )
-    db.add(DataFeedTag(dataFeedId=data_feed_id, tagId=tag_id))
-    db.add(
-        DataFeedEmbeddingMessageQueue(
-            dataFeedId=data_feed_id,
-            dataFeedName=file.filename,
-            dataType=DataFeedDataTypeEnum.File,
-            fileType=file_type,
-            messageStatus=MessageQueueStatusEnum.PENDING,
-            dataFeedURL=s3_url,
-            orgId=token_payload["orgId"],
-        )
-    )
-    await db.commit()
-
-    # Return a successful response
-    return TextOrFileUploadResponse(
-        success=True,
-        message="Data feed and tag uploaded successfully",
-        dataFeedId=data_feed_id,
-        tagId=tag_id,
+    return await process_file_upload(
+        db=db,
+        org_id=token_payload["orgId"],
+        file=file,
+        selected_tag=selectedTag,
     )
 
 
@@ -438,27 +276,6 @@ async def parse_urls(
 ):
     """
     Ingests selected scraped URLs by uploading their text to S3 and queueing them for vector embedding.
-
-    This function does the following:
-    1. Asserts requesting user membership in the tenant organization.
-    2. Fetches/creates the classification tag associated with these new page feeds.
-    3. Retrieves the text content of the selected scraped URLs from the temporary scraping records.
-    4. For each selected URL:
-       - Saves its text content to a local temporary workspace.
-       - Uploads the text file to long-term AWS S3 storage under tenant-scoped paths.
-       - Records a new `DataFeed` row of type `URL`.
-       - Appends a new indexing message to the `DataFeedEmbeddingMessageQueue` so background
-         embedding workers parse and register the page content in the pgvector database.
-       - Links the datafeed to the organization tag.
-    5. Cleans up the temporary scraped URL records matching this batch.
-
-    Args:
-        body (ParseURLRequest): Struct containing list of selected sub-URLs, tags, and userId.
-        token_payload (dict): Decoded and verified tenant JWT details.
-        db (AsyncSession): Active SQLAlchemy database session.
-
-    Returns:
-        dict: Success state confirmation string.
     """
     # Verify requesting user exists in the tenant organization
     _ = await fetch_existing_user(
@@ -468,92 +285,13 @@ async def parse_urls(
         ensure=True,
     )
 
-    # Abort if no URLs were selected in the frontend widget
-    if not body.urls:
-        return {
-            "message": "No URLs selected",
-            "success": False,
-        }
-
-    # Fetch or auto-create tag configurations
-    existing_tag = await fetch_existing_tag(
-        tag=body.tag, org_id=token_payload["orgId"], db=db, ensure=True
+    return await process_urls_ingestion(
+        db=db,
+        org_id=token_payload["orgId"],
+        user_id=body.userId,
+        urls=[{"groupId": u.groupId, "urlId": u.urlId} for u in body.urls] if body.urls else [],
+        tag_name=body.tag,
     )
-
-    existing_tag_id = existing_tag.tagId
-
-    urls_group_id = None
-    selected_urls_ids = []
-
-    # Map the unique sub-IDs and capture the batch group ID
-    for url_data in body.urls:
-        urls_group_id = url_data.groupId
-        selected_urls_ids.append(url_data.urlId)
-
-    # Fetch temporary crawled page contents matching selected IDs
-    selected_urls_data = await fetch_url_datafeed_by_ids(
-        user_id=body.userId, url_datafeed_ids=selected_urls_ids, db=db
-    )
-
-    if not selected_urls_data:
-        return {
-            "message": "No selected URLs found.",
-            "success": False,
-        }
-
-    for selected_url_data in selected_urls_data:
-        data_feed_id = uuid4()
-
-        # Save extracted page text content to a temporary workspace
-        temp_filename = f"{data_feed_id}.txt"
-        with open(temp_filename, "w") as temp_file:
-            temp_file.write(selected_url_data.content)
-
-        # Upload the text file asynchronously to long-term S3 storage
-        s3_url = await upload_file_to_s3(
-            uploaded_file_path=temp_filename,
-            s3_key=f"{token_payload['orgId']}/datafeeds/{temp_filename}",
-        )
-
-        # Clean up the temporary workspace file
-        os.remove(temp_filename)
-
-        # Insert long-term DataFeed configuration record in database
-        db.add(
-            DataFeed(
-                dataFeedId=data_feed_id,
-                dataFeedName=selected_url_data.url,
-                dataType=DataFeedDataTypeEnum.URL,
-                mainURL=selected_url_data.mainURL,
-                title=selected_url_data.pageTitle,
-                dataFeedURL=s3_url,
-                orgId=token_payload["orgId"],
-            )
-        )
-        # Push indexing job into the embedding queue for background workers
-        db.add(
-            DataFeedEmbeddingMessageQueue(
-                dataFeedId=data_feed_id,
-                dataFeedName=selected_url_data.url,
-                dataType=DataFeedDataTypeEnum.URL,
-                mainURL=selected_url_data.mainURL,
-                messageStatus=MessageQueueStatusEnum.PENDING,
-                dataFeedURL=s3_url,
-                orgId=token_payload["orgId"],
-            )
-        )
-        # Map tag to the newly registered page feed
-        db.add(DataFeedTag(dataFeedId=data_feed_id, tagId=existing_tag_id))
-
-    # Purge the temporary crawled URL assets to release database storage
-    await delete_url_datafeed_group(user_id=body.userId, group_id=urls_group_id, db=db)
-
-    await db.commit()
-
-    return {
-        "message": "Selected URLs are being processed.",
-        "success": True,
-    }
 
 
 @datafeed_router.get("/get_data_feed", response_model=GetDataFeedResponse)
@@ -570,7 +308,6 @@ async def get_data_feed(
     2. Fetches all registered datafeed records along with their classification tags.
     3. Queries subscription tiers to fetch the organization's designated total token count limit.
     4. Aggregates processed token counts across all active datafeeds to compute `totalTokensConsumed`.
-    5. Serializes files and webpage datafeeds alongside their respective lists of tag mappings.
 
     Args:
         userId (UUID): Requesting user ID.
@@ -580,10 +317,6 @@ async def get_data_feed(
     Returns:
         GetDataFeedResponse: Pydantic response containing search status, list of datafeed profiles,
                              aggregated tokens consumed, and the subscription token limit.
-
-    Raises:
-        HTTPException:
-            - 500 Internal Server Error: If database lookup or quota parsing fails.
     """
     try:
         # Validate the requesting user's organizational context
@@ -665,7 +398,6 @@ async def delete_data_feed(
     6. Removes the relational links for chatbots and tags.
     7. Contacts the vector database service to purge pgvector nodes associated with these datafeeds
        by calling `delete_nodes`.
-    8. Commits database changes or rolls back the transaction upon encountering exceptions.
 
     Args:
         body (DeleteDataFeedRequest): Struct containing list of target dataFeedIds.
@@ -674,12 +406,6 @@ async def delete_data_feed(
 
     Returns:
         dict: Success state confirmation string.
-
-    Raises:
-        HTTPException:
-            - 400 Bad Request: If the payload list of datafeed IDs is empty.
-            - 404 Not Found: If no matching active datafeeds exist under the organization.
-            - 500 Internal Server Error: If DB deletion or vector purging encounters exceptions.
     """
     # Verify requesting user exists in the tenant organization
     _ = await fetch_existing_user(
