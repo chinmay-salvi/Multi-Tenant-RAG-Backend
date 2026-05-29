@@ -97,6 +97,7 @@ class Organization(Base):
 
     orgId = Column(UUID, primary_key=True, index=True)
     orgCreatedAt = Column(DateTime, server_default=func.now(), nullable=False)
+    lastTicketSequence = Column(Integer, default=0, nullable=False)
 
     tags = relationship("Tag", back_populates="organization")
     dataFeeds = relationship("DataFeed", back_populates="organization")
@@ -408,22 +409,6 @@ class Tickets(Base):
     __table_args__ = (PrimaryKeyConstraint(ticketId, orgId),)
 
     chatbot = relationship("Chatbot", back_populates="tickets")
-
-
-# Event listener to set ticketId before insertion
-@event.listens_for(Tickets, "before_insert")
-def before_insert_listener(mapper, connection, target):
-    # Calculate ticketId based on the number of existing tickets for the organization
-    target.ticketId = (
-        len(
-            connection.execute(
-                select(Tickets.ticketId).filter(Tickets.orgId == target.orgId)
-            )
-            .scalars()
-            .fetchall()
-        )
-        + 1
-    )
 
 
 class Conversation(Base):

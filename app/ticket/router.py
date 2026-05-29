@@ -16,8 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.utils.s3_helper import upload_file_to_s3
+from app.db.tables import Tickets, Organization
+from sqlalchemy import update
 from app.auth import validate_user
-from app.db.tables import Tickets
 from app.user_org.crud import fetch_existing_user
 from app.chatbot.crud import fetch_chatbot_directly
 
@@ -89,8 +90,18 @@ async def submit_chatbot_ticket(
         org_id = chatbot.orgId
 
         try:
-            # Create a new ticket row. Note: event listener generates sequential 'ticketId' automatically
+            # Atomically increment organization counter & fetch new sequence ID
+            result = await db.execute(
+                update(Organization)
+                .where(Organization.orgId == org_id)
+                .values(lastTicketSequence=Organization.lastTicketSequence + 1)
+                .returning(Organization.lastTicketSequence)
+            )
+            ticket_id = result.scalar_one()
+
+            # Create a new ticket row with the explicitly set ticketId
             ticket = Tickets(
+                ticketId=ticket_id,
                 chatbotId=chatbotId,
                 category=category,
                 status="Open",
@@ -106,7 +117,6 @@ async def submit_chatbot_ticket(
             db.add(ticket)
             await db.commit()
             await db.refresh(ticket)
-            ticket_id = ticket.ticketId
 
             # Handle attachment uploads asynchronously using S3 helper utilities
             if file:
