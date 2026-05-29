@@ -338,7 +338,7 @@ async def handle_managed_inbox_webhook(
                 )
                 assistant_message.content = checked_response
 
-                notify_response = notify_managed_backend(
+                notify_response = await notify_managed_backend(
                     message.account["id"],
                     message.conversation["id"],
                     checked_response,
@@ -351,7 +351,7 @@ async def handle_managed_inbox_webhook(
                 logger.error(f"Error processing message response from chat engine: {e}")
                 assistant_message.status = MessageStatusEnum.ERROR
                 conversation.totalConversationMessage += 1
-                notify_response = notify_managed_backend(
+                notify_response = await notify_managed_backend(
                     message.account["id"],
                     message.conversation["id"],
                     "Sorry, something went wrong.Please try again",
@@ -416,7 +416,7 @@ async def transfer_to_human_agent(account_id, conversation_id, bot_token) -> str
     Triggers a live human agent handoff by altering the conversation status in the inbox panel.
     """
     logger.info("transfer_to_human_agent tool triggered")
-    _ = change_conversation_status(account_id, conversation_id, bot_token)
+    _ = await change_conversation_status(account_id, conversation_id, bot_token)
     return (
         "I'm transferring you to a human agent who will be able to assist you better."
     )

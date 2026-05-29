@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from datetime import datetime
 from aiocache import cached, SimpleMemoryCache
 from dateutil import parser
@@ -101,7 +102,7 @@ async def fetch_cached_plan_data(org_id: str) -> dict | None:
     Returns:
         dict | None: Mapped plan data dictionary.
     """
-    return fetch_plan_data(org_id)
+    return await asyncio.to_thread(fetch_plan_data, org_id)
 
 
 def check_datetime_validity(start_datetime: datetime, end_datetime: datetime) -> bool:

@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import logging
 import mimetypes
@@ -49,9 +50,8 @@ async def create_chatbot_instance(
     # Fetch current active chatbot deployments under the tenant
     chatbot_count = await count_existing_chatbot(org_id=org_id, db=db)
 
-    # Enforce plan quota guardrails
-    message = check_chatbot_limit(
-        org_id=org_id, utilised_chatbot_count=chatbot_count
+    message = await asyncio.to_thread(
+        check_chatbot_limit, org_id, chatbot_count
     )
 
     if message:

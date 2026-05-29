@@ -291,8 +291,8 @@ async def poll_data_and_process_embedding_messages(task_num: int):
                     or 0
                 )
 
-                error_message = check_datafeed_token_limit(
-                    message.orgId, utilized_tokens
+                error_message = await asyncio.to_thread(
+                    check_datafeed_token_limit, message.orgId, utilized_tokens
                 )
 
                 if error_message:
