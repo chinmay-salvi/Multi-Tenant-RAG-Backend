@@ -133,9 +133,6 @@ class ChatCallbackHandler(BaseCallbackHandler):
         source = schema.MessageSubProcessSourceEnum[event_type.name]
 
         # Avoid pushing tokens if the client has already disconnected
-        if self._send_chan._closed:
-            logger.debug("Received event after send channel closed. Ignoring.")
-            return
         try:
             # Stream the serialized subprocess metadata
             await self._send_chan.send(
@@ -147,8 +144,8 @@ class ChatCallbackHandler(BaseCallbackHandler):
                 )
             )
         except ClosedResourceError:
-            logger.exception(
-                "Tried sending SubProcess event %s after channel was closed",
+            logger.debug(
+                "Tried sending SubProcess event %s after channel was closed. Ignoring.",
                 f"(source={source})",
             )
 

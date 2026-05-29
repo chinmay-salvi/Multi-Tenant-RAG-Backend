@@ -3,6 +3,7 @@ from typing import List
 from typing import List, Optional
 from uuid import uuid4, UUID
 
+from anyio import ClosedResourceError
 from anyio.streams.memory import MemoryObjectSendStream
 from llama_index.core import (
     BaseCallbackHandler,
@@ -1091,13 +1092,13 @@ async def handle_chat_message(
         async for text in streaming_chat_response.async_response_gen():
             complete_response_str += text
 
-            if send_chan._closed:
+            try:
+                await send_chan.send(schema.StreamedMessage(content=text))
+            except ClosedResourceError:
                 logger.debug(
                     "Received streamed token after send channel closed. Ignoring."
                 )
                 return
-
-            await send_chan.send(schema.StreamedMessage(content=text))
 
         # Fallback response if generation fails to yield any text output
         if complete_response_str.strip() == "":
