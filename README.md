@@ -90,7 +90,7 @@ backend-agents-main/
 | **Outbound HTTP** | Non-blocking `httpx` AsyncClient (webhook dispatching) |
 | **File Storage** | AWS S3 Integration |
 | **Payments** | Razorpay webhooks |
-| **Worker Queues** | Dockerized embed & URL scrape workers (with skip_locked locks) |
+| **Worker Queues** | PgQueuer push-based queue (with asynchronous LISTEN/NOTIFY and DLQ retry pipelines) |
 
 ---
 
