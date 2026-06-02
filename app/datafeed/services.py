@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from typing import List
@@ -5,6 +6,7 @@ from uuid import UUID, uuid4
 
 import aiofiles
 from fastapi import UploadFile, HTTPException
+from pgqueuer.queries import Queries
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +15,6 @@ from app.db.tables import (
     DataFeed,
     DataFeedTag,
     DataFeedFileTypeEnum,
-    DataFeedEmbeddingMessageQueue,
     MessageQueueStatusEnum,
 )
 from app.user_org.crud import fetch_existing_tag
@@ -86,21 +87,9 @@ async def process_text_upload(
         )
     )
     db.add(DataFeedTag(dataFeedId=data_feed_id, tagId=tag_id))
-    # Push job metadata to Embedding Queue for background processing
-    db.add(
-        DataFeedEmbeddingMessageQueue(
-            dataFeedId=data_feed_id,
-            dataFeedName=text[:20],
-            messageStatus=MessageQueueStatusEnum.PENDING,
-            dataType=DataFeedDataTypeEnum.Text,
-            dataFeedURL=s3_url,
-            orgId=org_id,
-        )
-    )
+
 
     # Enqueue job to PgQueuer for non-blocking push processing
-    import json
-    from pgqueuer.queries import Queries
     conn = await db.connection()
     raw_conn = await conn.get_raw_connection()
     asyncpg_conn = raw_conn.driver_connection
@@ -195,21 +184,9 @@ async def process_file_upload(
         )
     )
     db.add(DataFeedTag(dataFeedId=data_feed_id, tagId=tag_id))
-    db.add(
-        DataFeedEmbeddingMessageQueue(
-            dataFeedId=data_feed_id,
-            dataFeedName=file.filename,
-            dataType=DataFeedDataTypeEnum.File,
-            fileType=file_type,
-            messageStatus=MessageQueueStatusEnum.PENDING,
-            dataFeedURL=s3_url,
-            orgId=org_id,
-        )
-    )
+
 
     # Enqueue job to PgQueuer for non-blocking push processing
-    import json
-    from pgqueuer.queries import Queries
     conn = await db.connection()
     raw_conn = await conn.get_raw_connection()
     asyncpg_conn = raw_conn.driver_connection
@@ -277,7 +254,6 @@ async def process_urls_ingestion(
             "success": False,
         }
 
-    from pgqueuer.queries import Queries
     conn = await db.connection()
     raw_conn = await conn.get_raw_connection()
     asyncpg_conn = raw_conn.driver_connection
@@ -314,23 +290,11 @@ async def process_urls_ingestion(
                 orgId=org_id,
             )
         )
-        # Push indexing job into the embedding queue for background workers
-        db.add(
-            DataFeedEmbeddingMessageQueue(
-                dataFeedId=data_feed_id,
-                dataFeedName=selected_url_data.url,
-                dataType=DataFeedDataTypeEnum.URL,
-                mainURL=selected_url_data.mainURL,
-                messageStatus=MessageQueueStatusEnum.PENDING,
-                dataFeedURL=s3_url,
-                orgId=org_id,
-            )
-        )
+
         # Map tag to the newly registered page feed
         db.add(DataFeedTag(dataFeedId=data_feed_id, tagId=existing_tag_id))
 
         # Enqueue job to PgQueuer for non-blocking push processing
-        import json
         payload = json.dumps({
             "dataFeedId": str(data_feed_id),
             "dataFeedName": selected_url_data.url,

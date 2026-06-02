@@ -197,26 +197,6 @@ class DataFeed(Base):
     chatbotDataFeeds = relationship("ChatbotDataFeeds", back_populates="datafeed")
 
 
-class DataFeedEmbeddingMessageQueue(Base):
-    messageId = Column(UUID, primary_key=True, default=func.uuid_generate_v4())
-    dataFeedId = Column(UUID, index=True, nullable=False)
-    dataFeedName = Column(String)
-    dataType = Column(to_pg_enum(DataFeedDataTypeEnum), nullable=False)
-    fileType = Column(to_pg_enum(DataFeedFileTypeEnum))
-    messageStatus = Column(to_pg_enum(MessageQueueStatusEnum))
-    mainURL = Column(String)
-    dataFeedURL = Column(String)
-    orgId = Column(UUID(as_uuid=True), ForeignKey("organization.orgId"))
-    createdAt = Column(TIMESTAMP, index=True, server_default=func.now())
-
-    __table_args__ = (
-        UniqueConstraint(
-            "dataFeedId",
-            "orgId",
-            name="unique_dataFeedId_orgId",
-        ),
-    )
-
 
 class URLScrapingMessageQueue(Base):
     groupId = Column(UUID, primary_key=True, index=True, nullable=False)

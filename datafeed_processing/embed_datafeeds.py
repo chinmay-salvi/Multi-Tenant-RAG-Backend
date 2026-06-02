@@ -40,7 +40,6 @@ from config import (
 from plans_helper import check_datafeed_token_limit
 from tables import (
     SysAuthCred,
-    DataFeedEmbeddingMessageQueue,
     MessageQueueStatusEnum,
     DataFeed,
 )
@@ -189,7 +188,7 @@ async def fetch_and_read_document_from_s3(
     return documents, token_count
 
 
-async def fetch_and_index_documents(data_feed_message: DataFeedEmbeddingMessageQueue) -> Tuple[bool, int]:
+async def fetch_and_index_documents(org_id: UUID, data_feed_id: UUID, s3_url: str) -> Tuple[bool, int]:
     """
     Downloads an S3 document, parses it, generates semantic embeddings, and stores them in pgvector.
 
@@ -201,7 +200,9 @@ async def fetch_and_index_documents(data_feed_message: DataFeedEmbeddingMessageQ
     5. Inserts nodes (chunks + embeddings) into the PGVectorStore database table.
 
     Args:
-        data_feed_message (DataFeedEmbeddingMessageQueue): The message queue record holding metadata.
+        org_id (UUID): The organization ID.
+        data_feed_id (UUID): The datafeed ID.
+        s3_url (str): The S3 URL.
 
     Returns:
         Tuple[bool, int]: (success_flag, calculated_token_count)
@@ -209,9 +210,9 @@ async def fetch_and_index_documents(data_feed_message: DataFeedEmbeddingMessageQ
     try:
         # Retrieve document from S3 and get text representation
         llama_index_docs, token_count = await fetch_and_read_document_from_s3(
-            data_feed_message.orgId,
-            data_feed_message.dataFeedId,
-            s3_url=data_feed_message.dataFeedURL,
+            org_id,
+            data_feed_id,
+            s3_url=s3_url,
         )
         global auth_creds_circular_array
 
@@ -259,6 +260,7 @@ async def process_embedding_job(job: Job) -> None:
         data = json.loads(job.payload.decode("utf-8"))
         data_feed_id = UUID(data["dataFeedId"])
         org_id = UUID(data["orgId"])
+        s3_url = data["dataFeedURL"]
     except Exception as e:
         logger.error(f"Failed to parse payload for job {job.id}: {e}")
         async with SessionLocal() as session:
@@ -270,33 +272,6 @@ async def process_embedding_job(job: Job) -> None:
         return
 
     logger.info(f"Picked embedding job {job.id} for dataFeedId: {data_feed_id}")
-
-    # Fetch corresponding message from DataFeedEmbeddingMessageQueue
-    async with SessionLocal() as session:
-        message = await session.scalar(
-            select(DataFeedEmbeddingMessageQueue)
-            .filter(DataFeedEmbeddingMessageQueue.dataFeedId == data_feed_id)
-        )
-
-    if not message:
-        logger.warning(f"DataFeedEmbeddingMessageQueue record not found for dataFeedId: {data_feed_id}. Skipping job.")
-        # Delete from pgqueuer active queue
-        async with SessionLocal() as session:
-            await session.execute(
-                text("DELETE FROM pgqueuer WHERE id = :job_id"),
-                {"job_id": job.id}
-            )
-            await session.commit()
-        return
-
-    # Update messageStatus to PROCESSING in DataFeedEmbeddingMessageQueue
-    async with SessionLocal() as session:
-        await session.execute(
-            update(DataFeedEmbeddingMessageQueue)
-            .where(DataFeedEmbeddingMessageQueue.messageId == message.messageId)
-            .values(messageStatus="PROCESSING")
-        )
-        await session.commit()
 
     try:
         async with SessionLocal() as session:
@@ -317,20 +292,17 @@ async def process_embedding_job(job: Job) -> None:
         )
 
         if error_message:
-            message_status = MessageQueueStatusEnum.ERROR
             active_status = -2
             token_count = -1
         else:
             # Process the message
             indexing_result, token_count = await fetch_and_index_documents(
-                message
+                org_id, data_feed_id, s3_url
             )
 
             if indexing_result:
-                message_status = MessageQueueStatusEnum.SUCCESS
                 active_status = 1
             else:
-                message_status = MessageQueueStatusEnum.ERROR
                 active_status = -1
 
         # After processing, mark the message status
@@ -339,11 +311,6 @@ async def process_embedding_job(job: Job) -> None:
                 update(DataFeed)
                 .where(DataFeed.dataFeedId == data_feed_id)
                 .values(activeStatus=active_status, tokenCount=token_count)
-            )
-            await session.execute(
-                update(DataFeedEmbeddingMessageQueue)
-                .where(DataFeedEmbeddingMessageQueue.messageId == message.messageId)
-                .values(messageStatus=message_status)
             )
             await session.commit()
 
@@ -359,11 +326,6 @@ async def process_embedding_job(job: Job) -> None:
                     update(DataFeed)
                     .where(DataFeed.dataFeedId == data_feed_id)
                     .values(activeStatus=-1, tokenCount=-1)
-                )
-                await session.execute(
-                    update(DataFeedEmbeddingMessageQueue)
-                    .where(DataFeedEmbeddingMessageQueue.dataFeedId == data_feed_id)
-                    .values(messageStatus=MessageQueueStatusEnum.ERROR)
                 )
                 await session.execute(
                     text(

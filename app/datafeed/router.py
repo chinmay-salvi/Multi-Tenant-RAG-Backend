@@ -17,7 +17,6 @@ from app.db.tables import (
     DataFeedTag,
     DataFeedFileTypeEnum,
     DeletedDataFeed,
-    DataFeedEmbeddingMessageQueue,
     MessageQueueStatusEnum,
     URLScrapingMessageQueue,
 )
@@ -42,7 +41,6 @@ from .crud import (
     fetch_datafeeds_with_tags,
     fetch_datafeeds_by_ids,
     fetch_datafeed_tags,
-    fetch_data_feed_embedding_message_directly,
     fetch_url_datafeed_by_ids,
     delete_url_datafeed_group,
     fetch_url_scraping_message,
@@ -473,14 +471,6 @@ async def delete_data_feed(
                 )
             )
             await db.delete(data_feed)
-
-            # Purge pending embedding requests if the datafeed is deleted before processing
-            queue_message = await fetch_data_feed_embedding_message_directly(
-                db=db, datafeed_id=data_feed.dataFeedId
-            )
-
-            if queue_message:
-                await db.delete(queue_message)
 
             # Purge pending embedding requests from PgQueuer if the datafeed is deleted before processing
             await db.execute(

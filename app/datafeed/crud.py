@@ -14,7 +14,6 @@ from app.db.tables import (
     DataFeed,
     DataFeedTag,
     TempUrlDataFeed,
-    DataFeedEmbeddingMessageQueue,
     MessageQueueStatusEnum,
     URLScrapingMessageQueue,
 )
@@ -105,18 +104,6 @@ async def delete_url_datafeed_group(user_id: UUID, group_id: UUID, db: AsyncSess
     )
     await db.execute(stmt)
 
-
-async def fetch_data_feed_embedding_message_directly(
-    db: AsyncSession, datafeed_id: UUID
-) -> DataFeedEmbeddingMessageQueue | None:
-    stmt_tag = select(DataFeedEmbeddingMessageQueue).filter(
-        DataFeedEmbeddingMessageQueue.dataFeedId == datafeed_id,
-        DataFeedEmbeddingMessageQueue.messageStatus == MessageQueueStatusEnum.PENDING,
-    )
-    result_tag = await db.execute(stmt_tag)
-    queue_message = result_tag.scalar_one_or_none()
-
-    return queue_message
 
 
 async def fetch_url_scraping_message(
