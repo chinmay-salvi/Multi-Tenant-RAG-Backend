@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 import aiofiles
 from fastapi import APIRouter, Depends, UploadFile, Form, File, HTTPException, status
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -172,6 +173,21 @@ async def scrape_url(
                 orgId=token_payload["orgId"],
             )
         )
+
+        # Enqueue job to PgQueuer for non-blocking push processing
+        import json
+        from pgqueuer.queries import Queries
+        conn = await db.connection()
+        raw_conn = await conn.get_raw_connection()
+        asyncpg_conn = raw_conn.driver_connection
+        queries = Queries.from_asyncpg_connection(asyncpg_conn)
+        payload = json.dumps({
+            "groupId": str(group_id),
+            "userId": str(body.userId),
+            "mainURL": body.url,
+            "orgId": str(token_payload["orgId"])
+        }).encode("utf-8")
+        await queries.enqueue("url_scraping", payload, 0)
 
         await db.commit()
 
@@ -465,6 +481,18 @@ async def delete_data_feed(
 
             if queue_message:
                 await db.delete(queue_message)
+
+            # Purge pending embedding requests from PgQueuer if the datafeed is deleted before processing
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM pgqueuer 
+                    WHERE entrypoint = 'datafeed_embedding' 
+                      AND convert_from(payload, 'UTF8')::jsonb ->> 'dataFeedId' = :data_feed_id
+                    """
+                ),
+                {"data_feed_id": str(data_feed.dataFeedId)}
+            )
 
         # Purge association maps linking active chatbots to deleted feeds
         for chatbot_datafeed in chatbot_datafeeds:

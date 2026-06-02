@@ -46,6 +46,7 @@ from tables import (
 )
 
 logger = logging.getLogger(__name__)
+from pgqueuer import Job
 
 
 def __setup_logging(log_level: str):
@@ -245,104 +246,186 @@ async def fetch_and_index_documents(data_feed_message: DataFeedEmbeddingMessageQ
         return False, -1
 
 
-async def poll_data_and_process_embedding_messages(task_num: int):
+async def process_embedding_job(job: Job) -> None:
     """
-    Background loop that continuously polls and processes pending datafeed ingestion tasks.
-
-    Polled elements are secured via 'with_for_update(skip_locked=True)' to prevent multiple workers
-    from processing the same task.
-
-    Args:
-        task_num (int): Identifier for this background worker thread.
+    Processes a single embedding job from PgQueuer.
     """
-    while True:
+    import traceback
+    from datetime import timedelta
+    from pgqueuer import RetryRequested
+    from sqlalchemy import text
+
+    try:
+        data = json.loads(job.payload.decode("utf-8"))
+        data_feed_id = UUID(data["dataFeedId"])
+        org_id = UUID(data["orgId"])
+    except Exception as e:
+        logger.error(f"Failed to parse payload for job {job.id}: {e}")
         async with SessionLocal() as session:
-            # Safely fetch the oldest pending queue message, skipping rows already locked by other threads
-            message = await session.scalar(
-                select(DataFeedEmbeddingMessageQueue)
-                .filter(DataFeedEmbeddingMessageQueue.messageStatus == "PENDING")
-                .order_by(asc(DataFeedEmbeddingMessageQueue.createdAt))
-                .limit(1)
-                .with_for_update(skip_locked=True)
+            await session.execute(
+                text("DELETE FROM pgqueuer WHERE id = :job_id"),
+                {"job_id": job.id}
+            )
+            await session.commit()
+        return
+
+    logger.info(f"Picked embedding job {job.id} for dataFeedId: {data_feed_id}")
+
+    # Fetch corresponding message from DataFeedEmbeddingMessageQueue
+    async with SessionLocal() as session:
+        message = await session.scalar(
+            select(DataFeedEmbeddingMessageQueue)
+            .filter(DataFeedEmbeddingMessageQueue.dataFeedId == data_feed_id)
+        )
+
+    if not message:
+        logger.warning(f"DataFeedEmbeddingMessageQueue record not found for dataFeedId: {data_feed_id}. Skipping job.")
+        # Delete from pgqueuer active queue
+        async with SessionLocal() as session:
+            await session.execute(
+                text("DELETE FROM pgqueuer WHERE id = :job_id"),
+                {"job_id": job.id}
+            )
+            await session.commit()
+        return
+
+    # Update messageStatus to PROCESSING in DataFeedEmbeddingMessageQueue
+    async with SessionLocal() as session:
+        await session.execute(
+            update(DataFeedEmbeddingMessageQueue)
+            .where(DataFeedEmbeddingMessageQueue.messageId == message.messageId)
+            .values(messageStatus="PROCESSING")
+        )
+        await session.commit()
+
+    try:
+        async with SessionLocal() as session:
+            # Fetch the organization's sum of active token counts
+            utilized_tokens = (
+                await session.scalar(
+                    select(func.sum(DataFeed.tokenCount)).where(
+                        DataFeed.tokenCount != -1,
+                        DataFeed.activeStatus == 1,
+                        DataFeed.orgId == org_id,
+                    )
+                )
+                or 0
             )
 
-            if message:
-                logger.info(
-                    f"Processing Message: {message.messageId} in Task No.: {task_num}"
-                )
-                # Set message status to PROCESSING to signal active state
-                await session.execute(
-                    update(DataFeedEmbeddingMessageQueue)
-                    .where(DataFeedEmbeddingMessageQueue.messageId == message.messageId)
-                    .values(messageStatus="PROCESSING")
-                )
-                await session.commit()
-                await session.refresh(message)
+        error_message = await asyncio.to_thread(
+            check_datafeed_token_limit, org_id, utilized_tokens
+        )
 
-                # Fetch the organization's sum of active token counts
-                utilized_tokens = (
-                    await session.scalar(
-                        select(func.sum(DataFeed.tokenCount)).where(
-                            DataFeed.tokenCount != -1,
-                            DataFeed.activeStatus == 1,
-                            DataFeed.orgId == message.orgId,
-                        )
-                    )
-                    or 0
-                )
+        if error_message:
+            message_status = MessageQueueStatusEnum.ERROR
+            active_status = -2
+            token_count = -1
+        else:
+            # Process the message
+            indexing_result, token_count = await fetch_and_index_documents(
+                message
+            )
 
-                error_message = await asyncio.to_thread(
-                    check_datafeed_token_limit, message.orgId, utilized_tokens
-                )
+            if indexing_result:
+                message_status = MessageQueueStatusEnum.SUCCESS
+                active_status = 1
+            else:
+                message_status = MessageQueueStatusEnum.ERROR
+                active_status = -1
 
-                if error_message:
-                    message_status = MessageQueueStatusEnum.ERROR
-                    active_status = -2
-                    token_count = -1
-                else:
-                    # Process the message outside the transaction to avoid blocking
-                    indexing_result, token_count = await fetch_and_index_documents(
-                        message
-                    )
+        # After processing, mark the message status
+        async with SessionLocal() as session:
+            await session.execute(
+                update(DataFeed)
+                .where(DataFeed.dataFeedId == data_feed_id)
+                .values(activeStatus=active_status, tokenCount=token_count)
+            )
+            await session.execute(
+                update(DataFeedEmbeddingMessageQueue)
+                .where(DataFeedEmbeddingMessageQueue.messageId == message.messageId)
+                .values(messageStatus=message_status)
+            )
+            await session.commit()
 
-                    if indexing_result:
-                        # set datafeed active to 1
-                        message_status = MessageQueueStatusEnum.SUCCESS
-                        active_status = 1
-                    else:
-                        message_status = MessageQueueStatusEnum.ERROR
-                        active_status = -1
+        logger.info(f"Successfully completed embedding job {job.id}")
 
-                # After processing, mark the message status
+    except Exception as e:
+        logger.exception(f"Error processing embedding job {job.id} on attempt {job.attempts}")
+        
+        # DLQ routing
+        if job.attempts >= 3:
+            async with SessionLocal() as session:
                 await session.execute(
                     update(DataFeed)
-                    .where(DataFeed.dataFeedId == message.dataFeedId)
-                    .values(activeStatus=active_status, tokenCount=token_count)
+                    .where(DataFeed.dataFeedId == data_feed_id)
+                    .values(activeStatus=-1, tokenCount=-1)
                 )
                 await session.execute(
                     update(DataFeedEmbeddingMessageQueue)
-                    .where(DataFeedEmbeddingMessageQueue.messageId == message.messageId)
-                    .values(messageStatus=message_status)
+                    .where(DataFeedEmbeddingMessageQueue.dataFeedId == data_feed_id)
+                    .values(messageStatus=MessageQueueStatusEnum.ERROR)
+                )
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO pgqueuer_dlq (original_job_id, channel, payload, error_message, traceback)
+                        VALUES (:job_id, :channel, :payload, :error_message, :traceback)
+                        """
+                    ),
+                    {
+                        "job_id": job.id,
+                        "channel": job.entrypoint,
+                        "payload": job.payload,
+                        "error_message": str(e),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                await session.execute(
+                    text("DELETE FROM pgqueuer WHERE id = :job_id"),
+                    {"job_id": job.id}
                 )
                 await session.commit()
-
-            # Sleep for some time before polling again
-            await asyncio.sleep(5)
+            logger.error(f"Job {job.id} failed after 3 attempts. Moved to DLQ.")
+        else:
+            # Re-raise to trigger PgQueuer retry mechanism with backoff
+            delay = timedelta(seconds=10 * (job.attempts + 1))
+            raise RetryRequested(delay=delay)
 
 
 async def main():
     global auth_creds_circular_array
+    import asyncpg
+    from pgqueuer import PgQueuer
+    from pgqueuer.db import AsyncpgPoolDriver
+    from pgqueuer.models import Schedule
+    from sqlalchemy import text
 
     if auth_creds_circular_array is None:
         auth_creds_circular_array = AuthCredsCircularArray()
         await auth_creds_circular_array.initialize()
 
-    # Run multiple instances of poll_data_and_process concurrently
-    tasks = [
-        asyncio.create_task(poll_data_and_process_embedding_messages(task_num))
-        for task_num in range(1, 4)
-    ]
-    await asyncio.gather(*tasks)
+    dsn = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    pool = await asyncpg.create_pool(dsn=dsn)
+    driver = AsyncpgPoolDriver(pool)
+    pgq = PgQueuer(driver)
+
+    # Register consumer entrypoint
+    pgq.entrypoint("datafeed_embedding", concurrency_limit=3)(process_embedding_job)
+
+    # Register pruning schedule
+    @pgq.schedule("prune_successful_jobs", "0 0 * * *")
+    async def prune_successful_jobs(schedule: Schedule) -> None:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                text(
+                    "DELETE FROM pgqueuer WHERE status = 'successful' AND created < NOW() - INTERVAL '7 days'"
+                )
+            )
+            await session.commit()
+            logger.info(f"Scheduled pruning deleted {result.rowcount} successful jobs older than 7 days.")
+
+    logger.info("Starting PgQueuer Datafeed Embedder consumer loop...")
+    await pgq.run()
 
 
 __setup_logging(LOG_LEVEL)

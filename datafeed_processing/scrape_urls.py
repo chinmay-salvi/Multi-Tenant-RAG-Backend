@@ -34,6 +34,7 @@ SCRAPER_MAX_DEPTH = 2
 MAX_CONCURRENT_TASKS = 25
 
 logger = logging.getLogger(__name__)
+from pgqueuer import Job
 
 
 def __setup_logging(log_level: str):
@@ -306,78 +307,138 @@ async def fetch_urls_recursive(main_url: str, user_id: UUID, group_id: UUID) -> 
     return urls_data
 
 
-async def poll_and_process_scraping_messages(task_num: int):
+async def process_scraping_job(job: Job) -> None:
     """
-    Continuous background worker loop that polls and processes pending URL crawling requests.
-
-    Polled elements are secured via row locks to support concurrent background workers.
-
-    Args:
-        task_num (int): Identifier for this background worker thread.
+    Processes a single url scraping job from PgQueuer.
     """
-    while True:
+    import traceback
+    from datetime import timedelta
+    from pgqueuer import RetryRequested
+    from sqlalchemy import text
+
+    try:
+        data = json.loads(job.payload.decode("utf-8"))
+        group_id = UUID(data["groupId"])
+        user_id = UUID(data["userId"])
+        main_url = data["mainURL"]
+        org_id = UUID(data["orgId"])
+    except Exception as e:
+        logger.error(f"Failed to parse payload for job {job.id}: {e}")
+        # Delete invalid payload jobs immediately from active queue
         async with SessionLocal() as session:
-            # Fetch the oldest pending message from the queue
-            message = await session.scalar(
-                select(URLScrapingMessageQueue)
-                .filter(URLScrapingMessageQueue.messageStatus == "PENDING")
-                .order_by(asc(URLScrapingMessageQueue.createdAt))
-                .limit(1)
-                .with_for_update(skip_locked=True)  # Lock the fetched row
+            await session.execute(
+                text("DELETE FROM pgqueuer WHERE id = :job_id"),
+                {"job_id": job.id}
             )
+            await session.commit()
+        return
 
-            if message:
-                logger.info(
-                    f"Scraping URLs for message with groupId: {message.groupId} and userId: {message.userId} in task no.: {task_num}"
+    logger.info(f"Picked scraping job {job.id} for mainURL: {main_url}")
+
+    # Mark status as PROCESSING in URLScrapingMessageQueue
+    async with SessionLocal() as session:
+        await session.execute(
+            update(URLScrapingMessageQueue)
+            .where(
+                URLScrapingMessageQueue.groupId == group_id,
+                URLScrapingMessageQueue.userId == user_id,
+            )
+            .values(messageStatus=MessageQueueStatusEnum.PROCESSING)
+        )
+        await session.commit()
+
+    try:
+        # Run recursive scraper crawl
+        urls_data = await fetch_urls_recursive(
+            main_url, user_id, group_id
+        )
+
+        async with SessionLocal() as session:
+            for page_url, url_data in urls_data.items():
+                session.add(TempUrlDataFeed(**url_data))
+
+            await session.execute(
+                update(URLScrapingMessageQueue)
+                .where(
+                    URLScrapingMessageQueue.groupId == group_id,
+                    URLScrapingMessageQueue.userId == user_id,
                 )
-                # Set the message status to processing
+                .values(messageStatus=MessageQueueStatusEnum.SUCCESS)
+            )
+            await session.commit()
+
+        logger.info(f"Successfully completed scraping job {job.id}")
+
+    except Exception as e:
+        logger.exception(f"Error processing scraping job {job.id} on attempt {job.attempts}")
+        
+        # If we have reached the limit (3 retries / 3 attempts total), route to DLQ
+        if job.attempts >= 3:
+            async with SessionLocal() as session:
                 await session.execute(
                     update(URLScrapingMessageQueue)
                     .where(
-                        URLScrapingMessageQueue.groupId == message.groupId,
-                        URLScrapingMessageQueue.userId == message.userId,
+                        URLScrapingMessageQueue.groupId == group_id,
+                        URLScrapingMessageQueue.userId == user_id,
                     )
-                    .values(messageStatus=MessageQueueStatusEnum.PROCESSING)
+                    .values(messageStatus=MessageQueueStatusEnum.ERROR)
                 )
-                await session.commit()
-                await session.refresh(message)
-
-                try:
-                    # Process the message outside the transaction to avoid blocking
-                    urls_data = await fetch_urls_recursive(
-                        message.mainURL, message.userId, message.groupId
-                    )
-
-                    for page_url, url_data in urls_data.items():
-                        session.add(TempUrlDataFeed(**url_data))
-
-                    # set datafeed active to 1
-                    message_status = MessageQueueStatusEnum.SUCCESS
-                except:
-                    message_status = MessageQueueStatusEnum.ERROR
-
-                # After processing, mark the message status
                 await session.execute(
-                    update(URLScrapingMessageQueue)
-                    .where(
-                        URLScrapingMessageQueue.groupId == message.groupId,
-                        URLScrapingMessageQueue.userId == message.userId,
-                    )
-                    .values(messageStatus=message_status)
+                    text(
+                        """
+                        INSERT INTO pgqueuer_dlq (original_job_id, channel, payload, error_message, traceback)
+                        VALUES (:job_id, :channel, :payload, :error_message, :traceback)
+                        """
+                    ),
+                    {
+                        "job_id": job.id,
+                        "channel": job.entrypoint,
+                        "payload": job.payload,
+                        "error_message": str(e),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                await session.execute(
+                    text("DELETE FROM pgqueuer WHERE id = :job_id"),
+                    {"job_id": job.id}
                 )
                 await session.commit()
-
-            # Sleep for some time before polling again
-            await asyncio.sleep(5)
+            logger.error(f"Job {job.id} failed after 3 attempts. Moved to DLQ.")
+        else:
+            # Re-raise to trigger PgQueuer retry mechanism with backoff
+            delay = timedelta(seconds=10 * (job.attempts + 1))
+            raise RetryRequested(delay=delay)
 
 
 async def main():
-    # Run multiple instances of poll_data_and_process concurrently
-    tasks = [
-        asyncio.create_task(poll_and_process_scraping_messages(task_num))
-        for task_num in range(1, 2)
-    ]
-    await asyncio.gather(*tasks)
+    import asyncpg
+    from pgqueuer import PgQueuer
+    from pgqueuer.db import AsyncpgPoolDriver
+    from pgqueuer.models import Schedule
+    from sqlalchemy import text
+
+    dsn = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    pool = await asyncpg.create_pool(dsn=dsn)
+    driver = AsyncpgPoolDriver(pool)
+    pgq = PgQueuer(driver)
+
+    # Register consumer entrypoint
+    pgq.entrypoint("url_scraping", concurrency_limit=1)(process_scraping_job)
+
+    # Register pruning schedule
+    @pgq.schedule("prune_successful_jobs", "0 0 * * *")
+    async def prune_successful_jobs(schedule: Schedule) -> None:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                text(
+                    "DELETE FROM pgqueuer WHERE status = 'successful' AND created < NOW() - INTERVAL '7 days'"
+                )
+            )
+            await session.commit()
+            logger.info(f"Scheduled pruning deleted {result.rowcount} successful jobs older than 7 days.")
+
+    logger.info("Starting PgQueuer URL Scraper consumer loop...")
+    await pgq.run()
 
 
 __setup_logging(LOG_LEVEL)

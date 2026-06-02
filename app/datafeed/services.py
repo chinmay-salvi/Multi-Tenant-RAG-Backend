@@ -97,6 +97,23 @@ async def process_text_upload(
             orgId=org_id,
         )
     )
+
+    # Enqueue job to PgQueuer for non-blocking push processing
+    import json
+    from pgqueuer.queries import Queries
+    conn = await db.connection()
+    raw_conn = await conn.get_raw_connection()
+    asyncpg_conn = raw_conn.driver_connection
+    queries = Queries.from_asyncpg_connection(asyncpg_conn)
+    payload = json.dumps({
+        "dataFeedId": str(data_feed_id),
+        "dataFeedName": text[:20],
+        "dataType": DataFeedDataTypeEnum.Text.value,
+        "dataFeedURL": s3_url,
+        "orgId": str(org_id),
+    }).encode("utf-8")
+    await queries.enqueue("datafeed_embedding", payload, 0)
+
     await db.commit()
 
     return TextOrFileUploadResponse(
@@ -189,6 +206,24 @@ async def process_file_upload(
             orgId=org_id,
         )
     )
+
+    # Enqueue job to PgQueuer for non-blocking push processing
+    import json
+    from pgqueuer.queries import Queries
+    conn = await db.connection()
+    raw_conn = await conn.get_raw_connection()
+    asyncpg_conn = raw_conn.driver_connection
+    queries = Queries.from_asyncpg_connection(asyncpg_conn)
+    payload = json.dumps({
+        "dataFeedId": str(data_feed_id),
+        "dataFeedName": file.filename,
+        "dataType": DataFeedDataTypeEnum.File.value,
+        "fileType": file_type.value,
+        "dataFeedURL": s3_url,
+        "orgId": str(org_id),
+    }).encode("utf-8")
+    await queries.enqueue("datafeed_embedding", payload, 0)
+
     await db.commit()
 
     return TextOrFileUploadResponse(
@@ -242,6 +277,12 @@ async def process_urls_ingestion(
             "success": False,
         }
 
+    from pgqueuer.queries import Queries
+    conn = await db.connection()
+    raw_conn = await conn.get_raw_connection()
+    asyncpg_conn = raw_conn.driver_connection
+    queries = Queries.from_asyncpg_connection(asyncpg_conn)
+
     for selected_url_data in selected_urls_data:
         data_feed_id = uuid4()
 
@@ -287,6 +328,18 @@ async def process_urls_ingestion(
         )
         # Map tag to the newly registered page feed
         db.add(DataFeedTag(dataFeedId=data_feed_id, tagId=existing_tag_id))
+
+        # Enqueue job to PgQueuer for non-blocking push processing
+        import json
+        payload = json.dumps({
+            "dataFeedId": str(data_feed_id),
+            "dataFeedName": selected_url_data.url,
+            "dataType": DataFeedDataTypeEnum.URL.value,
+            "mainURL": selected_url_data.mainURL,
+            "dataFeedURL": s3_url,
+            "orgId": str(org_id),
+        }).encode("utf-8")
+        await queries.enqueue("datafeed_embedding", payload, 0)
 
     # Purge the temporary crawled URL assets to release database storage
     await delete_url_datafeed_group(user_id=user_id, group_id=urls_group_id, db=db)

@@ -37,6 +37,39 @@ async def create_tables_if_not_exists():
     vector_store = await get_vector_store_singleton()
     await vector_store.run_setup()
 
+    # Install pgqueuer database triggers, tables, and DLQ table
+    import asyncpg
+    from pgqueuer.queries import Queries
+    try:
+        dsn = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        connection = await asyncpg.connect(dsn=dsn)
+        queries = Queries.from_asyncpg_connection(connection)
+        has_table = await queries.has_table("pgqueuer")
+        if not has_table:
+            print("PgQueuer schema not found. Installing database triggers and tables...")
+            await queries.install()
+            print("PgQueuer schema installed successfully.")
+        else:
+            print("PgQueuer schema verified.")
+
+        # Create pgqueuer_dlq table
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pgqueuer_dlq (
+                id SERIAL PRIMARY KEY,
+                original_job_id INT,
+                channel TEXT NOT NULL,
+                payload BYTEA,
+                error_message TEXT,
+                traceback TEXT,
+                failed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        await connection.close()
+    except Exception as e:
+        print(f"Failed to auto-initialize PgQueuer schema: {e}")
+
 
 async def check_database_connection(
     max_attempts: int = 30, sleep_interval: int = 1
