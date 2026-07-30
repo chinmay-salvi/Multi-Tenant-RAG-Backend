@@ -54,6 +54,14 @@ class CustomPGVectorStore(PGVectorStore):
             async with session.begin():
                 conn = await session.connection()
                 await conn.run_sync(self._base.metadata.create_all)
+                
+                # Add a B-Tree index on orgId within the metadata JSONB column to prevent sequential scans
+                # LlamaIndex prefixes the table name with 'data_'
+                index_stmt = sqlalchemy.text(
+                    f"CREATE INDEX IF NOT EXISTS idx_vector_store_orgid "
+                    f"ON data_{VECTOR_STORE_TABLE_NAME} ((metadata_->>'orgId'))"
+                )
+                await conn.execute(index_stmt)
         did_run_setup = True
 
 
